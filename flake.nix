@@ -22,7 +22,7 @@
 
         codexDmg = pkgs.fetchurl {
           url = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg";
-          hash = "sha256-KvrWUJgRYbuG/YFSIc/pdkRhGRK3fDqfKj10O7rjFck=";
+          hash = "sha256-4FroU+UDXJSbB5FfjGhiGyXrQ/R+UYXuaYPoR7oXbyc=";
         };
 
         electronLibs = with pkgs; [
@@ -200,7 +200,7 @@ PY
 
           outputHashAlgo = "sha256";
           outputHashMode = "recursive";
-          outputHash = "sha256-vsoEAp9bS7tMNLirPg1oLskSimz1eOkjNT+fNeys4rw=";
+          outputHash = "sha256-jgiKwhNPvufFxqvZX+mq+w3pYLp762jlgz7JwmABwvo=";
           unsafeDiscardReferences.out = true;
 
           dontConfigure = true;
