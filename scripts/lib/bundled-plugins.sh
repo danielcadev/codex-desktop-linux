@@ -809,9 +809,9 @@ function codexLinuxBrowserUseConfigShim() {
     read: async () => ({ config: await codexLinuxBrowserUseReadToml("config.toml") }),
     readRequirements: async () => ({ requirements: null }),
     readToml: async (filePath) => codexLinuxBrowserUseReadToml(filePath),
-    writeToml: async (filePath, data) => codexLinuxBrowserUseWriteToml(filePath, data),
-    writeValue: async (keyPath, value) => codexLinuxBrowserUseWriteValue(keyPath, value),
-    batchWrite: async (request) => codexLinuxBrowserUseBatchWrite(request),
+    writeToml: codexLinuxBrowserUseIgnoreConfigWrite,
+    writeValue: codexLinuxBrowserUseIgnoreConfigWrite,
+    batchWrite: codexLinuxBrowserUseIgnoreConfigWrite,
   };
 
   try {
@@ -872,61 +872,8 @@ async function codexLinuxBrowserUseReadToml(filePath) {
   }
 }
 
-async function codexLinuxBrowserUseWriteToml(filePath, data) {
-  let configPath = codexLinuxBrowserUseConfigPath(filePath);
-  if (configPath == null) return;
-
-  let { mkdir, writeFile } = await import("node:fs/promises");
-  let directory = configPath.slice(0, configPath.lastIndexOf("/"));
-  if (directory) await mkdir(directory, { recursive: true });
-  await writeFile(configPath, codexLinuxBrowserUseStringifyToml(data), "utf8");
-}
-
-async function codexLinuxBrowserUseWriteValue(keyPath, value) {
-  if (!Array.isArray(keyPath) || keyPath.length === 0) return;
-  let config = await codexLinuxBrowserUseReadToml("config.toml");
-  codexLinuxBrowserUseSetPath(config, keyPath, value);
-  await codexLinuxBrowserUseWriteToml("config.toml", config);
-}
-
-async function codexLinuxBrowserUseBatchWrite(request) {
-  if (!request || typeof request != "object" || !Array.isArray(request.edits)) return;
-  let byFile = new Map();
-
-  for (let edit of request.edits) {
-    let keyPath = edit?.keyPath ?? edit?.key_path;
-    if (!edit || typeof edit != "object" || !Array.isArray(keyPath) || keyPath.length === 0) {
-      continue;
-    }
-
-    let filePath = typeof edit.path == "string" && edit.path.length > 0
-      ? edit.path
-      : typeof edit.filePath == "string" && edit.filePath.length > 0
-        ? edit.filePath
-        : typeof edit.file_path == "string" && edit.file_path.length > 0
-          ? edit.file_path
-          : "config.toml";
-    if (!byFile.has(filePath)) byFile.set(filePath, await codexLinuxBrowserUseReadToml(filePath));
-    codexLinuxBrowserUseSetPath(byFile.get(filePath), keyPath, edit.value);
-  }
-
-  for (let [filePath, data] of byFile) {
-    await codexLinuxBrowserUseWriteToml(filePath, data);
-  }
-}
-
-function codexLinuxBrowserUseSetPath(root, keyPath, value) {
-  let target = root;
-  for (let index = 0; index < keyPath.length - 1; index += 1) {
-    let key = keyPath[index];
-    if (typeof key != "string" || key.length === 0) return;
-    target = target[key] && typeof target[key] == "object" && !Array.isArray(target[key])
-      ? target[key]
-      : (target[key] = {});
-  }
-
-  let lastKey = keyPath[keyPath.length - 1];
-  if (typeof lastKey == "string" && lastKey.length > 0) target[lastKey] = value;
+async function codexLinuxBrowserUseIgnoreConfigWrite() {
+  return undefined;
 }
 
 function codexLinuxBrowserUseParseToml(source) {
@@ -980,47 +927,6 @@ function codexLinuxBrowserUseParseTomlValue(value) {
   }
 
   return value;
-}
-
-function codexLinuxBrowserUsePlainObject(value) {
-  return value != null && typeof value == "object" && !Array.isArray(value);
-}
-
-function codexLinuxBrowserUseStringifyToml(data) {
-  let lines = [];
-
-  function writeSection(section, path) {
-    let values = [];
-    let children = [];
-
-    for (let [key, value] of Object.entries(section ?? {})) {
-      if (value === undefined) continue;
-      if (codexLinuxBrowserUsePlainObject(value)) children.push([key, value]);
-      else values.push([key, value]);
-    }
-
-    if (path.length > 0 && values.length > 0) lines.push(`[${path.join(".")}]`);
-    for (let [key, value] of values) {
-      lines.push(`${key} = ${codexLinuxBrowserUseTomlValue(value)}`);
-    }
-
-    for (let [key, value] of children) {
-      if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
-      writeSection(value, [...path, key]);
-    }
-  }
-
-  writeSection(codexLinuxBrowserUsePlainObject(data) ? data : {}, []);
-  return `${lines.join("\n")}\n`;
-}
-
-function codexLinuxBrowserUseTomlValue(value) {
-  if (Array.isArray(value)) {
-    return `[${value.map(codexLinuxBrowserUseTomlValue).join(", ")}]`;
-  }
-  if (typeof value == "boolean") return value ? "true" : "false";
-  if (typeof value == "number" && Number.isFinite(value)) return String(value);
-  return JSON.stringify(String(value ?? ""));
 }
 '''
 replacement = (
