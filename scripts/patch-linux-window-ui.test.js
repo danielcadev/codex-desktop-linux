@@ -58,6 +58,7 @@ const {
   applyLinuxBrowserUseNonLocalNavigationPatch,
   applyLinuxAppServerBackfillWaitPatch,
   applyLinuxOpaqueBackgroundPatch,
+  applyLinuxOwlFeatureBindingFallbackPatch,
   applyLinuxFastModeModelGuardPatch,
   applyLinuxOpaqueWindowsDefaultPatch,
   applyLinuxReadyToShowWindowStatePatch,
@@ -79,6 +80,7 @@ const {
   patchProjectlessDocumentsAssets,
   patchKeybindsSettingsAssets,
   patchAutomationScheduleAssets,
+  patchLinuxOwlFeatureBindingFallbackAssets,
   createPatchReport,
   corePatchDescriptors,
   detectLinuxTargetContext,
@@ -645,6 +647,7 @@ test("default core patch descriptors are grouped and unique", () => {
     "linux-set-icon",
     "linux-resize-repaint",
     "linux-opaque-background",
+    "linux-owl-feature-binding-fallback",
     "linux-avatar-overlay-mouse-passthrough",
     "linux-browser-use-availability",
     "linux-browser-use-non-local-navigation",
@@ -702,6 +705,10 @@ test("default core patch descriptors are grouped and unique", () => {
   assert.ok(descriptors.every((descriptor) => descriptor.sourcePath.includes(`${path.sep}core${path.sep}`)));
   assert.equal(
     descriptors.find((descriptor) => descriptor.id === "package-desktop-name")?.phase,
+    "extracted-app",
+  );
+  assert.equal(
+    descriptors.find((descriptor) => descriptor.id === "linux-owl-feature-binding-fallback")?.phase,
     "extracted-app",
   );
   assert.match(
@@ -5375,6 +5382,81 @@ test("adds a fallback source for renderer git-origins requests without weakening
     /if\(r===`git-origins`\)return t\.Kt\(\{source:`linux_git_origins_missing_source_fallback`,requestKind:r\},l\)/,
   );
   assert.match(patched, /throw Error\(`Missing git operation source for \$\{r\}`\)/);
+});
+
+test("falls back when Electron Owl feature binding is absent on Linux", () => {
+  const source =
+    "var Ge={parse:e=>e};function Qe(){let e=process._linkedBinding;if(typeof e!=`function`)throw Error(`Owl feature binding is unavailable`);return Ge.parse(e.call(process,`electron_common_owl_features`))}";
+
+  const patched = applyPatchTwice(applyLinuxOwlFeatureBindingFallbackPatch, source);
+
+  assert.match(patched, /No such binding was linked/);
+  assert.match(patched, /isOwlFeatureEnabled:\(\)=>!1/);
+  assert.match(patched, /throw t/);
+
+  const sandbox = {
+    process: {
+      _linkedBinding() {
+        throw new Error("No such binding was linked: electron_common_owl_features");
+      },
+    },
+    result: null,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(`${patched};result=Qe().isOwlFeatureEnabled(\`SomeOwlFlag\`);`, sandbox);
+
+  assert.equal(sandbox.result, false);
+});
+
+test("preserves real Electron Owl feature binding when available", () => {
+  const source =
+    "var Ge={parse:e=>e};function Qe(){let e=process._linkedBinding;if(typeof e!=`function`)throw Error(`Owl feature binding is unavailable`);return Ge.parse(e.call(process,`electron_common_owl_features`))}";
+
+  const patched = applyPatchTwice(applyLinuxOwlFeatureBindingFallbackPatch, source);
+  const sandbox = {
+    process: {
+      _linkedBinding(name) {
+        assert.equal(name, "electron_common_owl_features");
+        return { isOwlFeatureEnabled: (feature) => feature === "EnabledOwlFlag" };
+      },
+    },
+    enabled: null,
+    disabled: null,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(
+    `${patched};enabled=Qe().isOwlFeatureEnabled(\`EnabledOwlFlag\`);disabled=Qe().isOwlFeatureEnabled(\`OtherOwlFlag\`);`,
+    sandbox,
+  );
+
+  assert.equal(sandbox.enabled, true);
+  assert.equal(sandbox.disabled, false);
+});
+
+test("patches Electron Owl feature binding fallback outside the main bundle", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-owl-feature-build-"));
+  try {
+    const buildDir = path.join(tempRoot, ".vite", "build");
+    fs.mkdirSync(buildDir, { recursive: true });
+    const bundlePath = path.join(buildDir, "workspace-root-drop-handler-test.js");
+    fs.writeFileSync(
+      bundlePath,
+      "var Ge={parse:e=>e};function Qe(){let e=process._linkedBinding;if(typeof e!=`function`)throw Error(`Owl feature binding is unavailable`);return Ge.parse(e.call(process,`electron_common_owl_features`))}",
+      "utf8",
+    );
+
+    assert.deepEqual(patchLinuxOwlFeatureBindingFallbackAssets(tempRoot), {
+      matched: 1,
+      changed: 1,
+    });
+    assert.match(fs.readFileSync(bundlePath, "utf8"), /isOwlFeatureEnabled:\(\)=>!1/);
+    assert.deepEqual(patchLinuxOwlFeatureBindingFallbackAssets(tempRoot), {
+      matched: 1,
+      changed: 0,
+    });
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("missing icon asset skips only icon patches", () => {
