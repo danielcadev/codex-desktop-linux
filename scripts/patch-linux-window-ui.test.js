@@ -2189,6 +2189,14 @@ test("adds Linux avatar overlay mouse passthrough recovery", () => {
   assert.match(patched, /getSwitchValue\(`ozone-platform`\)/);
   assert.match(patched, /return e===`x11`\|\|e===``&&!process\.env\.WAYLAND_DISPLAY/);
   assert.doesNotMatch(patched, /XDG_SESSION_TYPE/);
+  assert.match(
+    patched,
+    /process\.platform===`linux`&&\(this\.codexLinuxIsAvatarShapeBackend\(\)\?\(this\.codexLinuxStartAvatarPassthroughRecovery\(\),this\.codexLinuxSyncAvatarPointerInteractivity\(e\)\):\(this\.codexLinuxStopAvatarPassthroughRecovery\(\),this\.pointerInteractive=!1\)\);/,
+  );
+  assert.doesNotMatch(
+    patched,
+    /process\.platform===`linux`&&\(this\.codexLinuxStartAvatarPassthroughRecovery\(\),this\.codexLinuxSyncAvatarPointerInteractivity\(e\)\);/,
+  );
   assert.doesNotMatch(patched, /if\(process\.platform===`linux`&&typeof e\.setShape==`function`\)\{this\.codexLinuxStopAvatarPassthroughRecovery\(\),/);
   assert.doesNotMatch(patched, /typeof e\.setShape==`function`&&!this\.codexLinuxIsI3Session\(\)/);
   assert.match(patched, /if\(t==null\)return null/);
@@ -2324,6 +2332,19 @@ test("Linux avatar overlay interactivity is bounded to avatar regions", () => {
   context.process.env.WAYLAND_DISPLAY = "wayland-0";
   assert.equal(controller.codexLinuxIsAvatarShapeBackend(), false);
   assert.equal(controller.codexLinuxApplyAvatarInputShape(overlayWindow), false);
+  const ignoreMouseEvents = [];
+  controller.window = {
+    isDestroyed: () => false,
+    setIgnoreMouseEvents(ignore, options) {
+      ignoreMouseEvents.push({ ignore, options });
+    },
+  };
+  controller.pointerInteractive = true;
+  controller.mousePassthroughEnabled = false;
+  controller.applyPointerInteractivityPolicy();
+  assert.equal(controller.pointerInteractive, false);
+  assert.equal(ignoreMouseEvents.at(-1)?.ignore, true);
+  assert.equal(ignoreMouseEvents.at(-1)?.options?.forward, true);
   let setShapeCalls = 0;
   ozonePlatform = "x11";
   assert.equal(controller.codexLinuxIsAvatarShapeBackend(), true);
@@ -2359,6 +2380,104 @@ test("Linux avatar overlay interactivity is bounded to avatar regions", () => {
     }),
     false,
   );
+});
+
+test("Linux avatar composition surfaces cannot take keyboard focus on Wayland", () => {
+  const compositionSurfaceSource = [
+    "function I(e){a?.orderSurfaces(bp(D?.slots??[]));for(let t of e.visibleSurfaceIds){let e=v.get(t);e!=null&&(e.window.setOpacity(1),e.keyboardInteractive?(e.window.setFocusable(!0),e.window.setIgnoreMouseEvents(!1)):e.window.showInactive(),te(e))}}",
+    "function te(e){if(e==null||!e.visible||!e.attached||e.preparation.id!==S)return;e.window.show(),e.window.setFocusable(!0),e.window.setIgnoreMouseEvents(!1),e.keyboardInteractive=!0;let t=!1,n=()=>{t||!e.keyboardInteractive||(t=!0,p?.(e.window))};e.window.isFocused()||e.window.once(`focus`,n),o(),e.window.focus(),e.window.webContents.focus(),e.window.isFocused()&&n(),S=null}",
+    "function ce(e,t){let n=v.get(e);if(!t){S===e&&(S=null),n!=null&&(n.keyboardInteractive=!1),ue();return}n?.keyboardInteractive||S===e||(S=e,te(n))}",
+    "function ue(){for(let[e,t]of v){let n=e===C;t.window.setFocusable(t.keyboardInteractive||n),n?(t.window.setIgnoreMouseEvents(!1),de(t)):t.window.setIgnoreMouseEvents(!0,{forward:!0})}}",
+    "function create(){throw Error(`Missing avatar overlay composition surface: ${n}`)}",
+  ].join("");
+  const patched = applyPatchTwice(
+    applyLinuxAvatarOverlayMousePassthroughPatch,
+    compositionSurfaceSource,
+  );
+
+  assert.match(patched, /function codexLinuxAvatarOverlaySurfacesCanFocus\(\)\{/);
+  assert.match(patched, /e\.keyboardInteractive&&codexLinuxAvatarOverlaySurfacesCanFocus\(\)\?/);
+  assert.match(patched, /function te\(e\)\{if\(!codexLinuxAvatarOverlaySurfacesCanFocus\(\)\)return;/);
+  assert.match(
+    patched,
+    /function ce\(e,t\)\{process\.platform===`linux`&&!codexLinuxAvatarOverlaySurfacesCanFocus\(\)&&\(t=!1\);/,
+  );
+  assert.match(
+    patched,
+    /t\.window\.setFocusable\(codexLinuxAvatarOverlaySurfacesCanFocus\(\)&&\(t\.keyboardInteractive\|\|n\)\)/,
+  );
+
+  const events = [];
+  let ozonePlatform = "wayland";
+  const context = {
+    process: { platform: "linux", env: { WAYLAND_DISPLAY: "wayland-0" } },
+    n: { app: { commandLine: { getSwitchValue: () => ozonePlatform } } },
+    a: { app: { commandLine: { getSwitchValue: () => ozonePlatform } } },
+    bp: () => [],
+    D: null,
+    C: null,
+    S: null,
+    p: null,
+    o() {
+      events.push("flush");
+    },
+    de() {
+      events.push("mouse");
+    },
+    v: new Map(),
+  };
+  const makeSurface = () => ({
+    visible: true,
+    attached: true,
+    keyboardInteractive: false,
+    preparation: { id: "composer" },
+    window: {
+      setOpacity(value) {
+        events.push(["opacity", value]);
+      },
+      setFocusable(value) {
+        events.push(["focusable", value]);
+      },
+      setIgnoreMouseEvents(ignore, options) {
+        events.push(["ignore", ignore, options ?? null]);
+      },
+      showInactive() {
+        events.push("showInactive");
+      },
+      show() {
+        events.push("show");
+      },
+      isFocused: () => false,
+      once(eventName) {
+        events.push(["once", eventName]);
+      },
+      focus() {
+        events.push("focus");
+      },
+      webContents: {
+        focus() {
+          events.push("webContents.focus");
+        },
+      },
+    },
+  });
+  context.v.set("composer", makeSurface());
+  vm.runInNewContext(`${patched};globalThis.api={I,ce,ue};`, context);
+
+  context.api.ce("composer", true);
+  assert.deepEqual(events.filter((event) => event === "focus" || event === "webContents.focus"), []);
+  assert.deepEqual(events.filter((event) => Array.isArray(event) && event[0] === "focusable").at(-1), [
+    "focusable",
+    false,
+  ]);
+
+  events.length = 0;
+  ozonePlatform = "x11";
+  context.process.env.WAYLAND_DISPLAY = "wayland-0";
+  context.v.set("composer", makeSurface());
+  context.api.ce("composer", true);
+  assert.ok(events.includes("focus"));
+  assert.ok(events.includes("webContents.focus"));
 });
 
 test("keeps avatar overlay layout sync working after layout alias drift", () => {
