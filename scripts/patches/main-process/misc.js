@@ -172,6 +172,21 @@ function applyLinuxOwlFeatureBindingFallbackPatch(currentSource) {
     return currentSource;
   }
 
+  const safeNullLoaderRegex =
+    /function ([A-Za-z_$][\w$]*)\(\)\{let ([A-Za-z_$][\w$]*)=process\._linkedBinding;if\(typeof \2!=`function`\)return null;let ([A-Za-z_$][\w$]*);try\{\3=\2\.call\(process,(?:`electron_common_owl_features`|[A-Za-z_$][\w$]*)\)\}catch\(([A-Za-z_$][\w$]*)\)\{if\([A-Za-z_$][\w$]*\(\4\)\)return null;throw \4\}return [A-Za-z_$][\w$]*\.parse\(\3\)\}/u;
+  const safeNullLoaderMatch = currentSource.match(safeNullLoaderRegex);
+  if (safeNullLoaderMatch != null) {
+    const [, loaderFnName] = safeNullLoaderMatch;
+    const escapedLoaderFnName = loaderFnName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const safeNullConsumerRegex = new RegExp(
+      `let ([A-Za-z_$][\\w$]*)=${escapedLoaderFnName}\\(\\);if\\(\\1==null\\)return!1;try\\{return \\1\\.isOwlFeatureEnabled\\(`,
+      "u",
+    );
+    if (safeNullConsumerRegex.test(currentSource)) {
+      return currentSource;
+    }
+  }
+
   const loaderRegex =
     /function ([A-Za-z_$][\w$]*)\(\)\{let ([A-Za-z_$][\w$]*)=process\._linkedBinding;if\(typeof \2!=`function`\)throw Error\(`Owl feature binding is unavailable`\);return ([A-Za-z_$][\w$]*)\.parse\(\2\.call\(process,`electron_common_owl_features`\)\)\}/u;
   const match = currentSource.match(loaderRegex);

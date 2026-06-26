@@ -52,7 +52,62 @@ function avatarOverlayRegionStart(source) {
   return stateMessageIndex === -1 ? 0 : stateMessageIndex;
 }
 
+function avatarOverlayMarkerIndices(source) {
+  const markers = [
+    "appearance:`avatarOverlay`",
+    "avatar-overlay-open-state-changed",
+  ];
+  const indices = [];
+  for (const marker of markers) {
+    let index = source.indexOf(marker);
+    while (index !== -1) {
+      indices.push(index);
+      index = source.indexOf(marker, index + marker.length);
+    }
+  }
+  return indices.sort((left, right) => left - right);
+}
+
+function findClassContainingIndex(source, index) {
+  const classRegex = /class(?:\s+[A-Za-z_$][\w$]*)?(?:\s+extends\s+[A-Za-z_$][\w$.]*)?\{/g;
+  let candidate = null;
+  let match;
+  while ((match = classRegex.exec(source)) != null) {
+    if (match.index > index) {
+      break;
+    }
+    const openIndex = match.index + match[0].length - 1;
+    const closeIndex = findMatchingBrace(source, openIndex);
+    if (closeIndex === -1) {
+      classRegex.lastIndex = match.index + "class".length;
+      continue;
+    }
+    if (openIndex <= index && index <= closeIndex) {
+      candidate = {
+        start: match.index,
+        end: closeIndex + 1,
+        text: source.slice(match.index, closeIndex + 1),
+      };
+      classRegex.lastIndex = match.index + "class".length;
+      continue;
+    }
+    classRegex.lastIndex = closeIndex + 1;
+  }
+  return candidate;
+}
+
 function findAvatarOverlayClass(source) {
+  for (const markerIndex of avatarOverlayMarkerIndices(source)) {
+    const markerClass = findClassContainingIndex(source, markerIndex);
+    if (
+      markerClass != null &&
+      (markerClass.text.includes("appearance:`avatarOverlay`") ||
+        markerClass.text.includes("avatar-overlay-open-state-changed"))
+    ) {
+      return markerClass;
+    }
+  }
+
   const classRegex = /class(?:\s+[A-Za-z_$][\w$]*)?(?:\s+extends\s+[A-Za-z_$][\w$.]*)?\{/g;
   classRegex.lastIndex = avatarOverlayRegionStart(source);
   let match;
@@ -60,7 +115,8 @@ function findAvatarOverlayClass(source) {
     const openIndex = match.index + match[0].length - 1;
     const closeIndex = findMatchingBrace(source, openIndex);
     if (closeIndex === -1) {
-      return null;
+      classRegex.lastIndex = match.index + "class".length;
+      continue;
     }
     const text = source.slice(match.index, closeIndex + 1);
     if (

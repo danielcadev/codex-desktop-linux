@@ -836,6 +836,11 @@ test("fast-mode guard descriptor follows upstream service-tier bundle names", ()
   assert.ok(descriptor.pattern.test("read-service-tier-for-request-BJ8QN0Q7.js"));
   assert.ok(descriptor.pattern.test("use-service-tier-settings-DFXPADNF.js"));
   assert.ok(descriptor.pattern.test("app-server-manager-signals-BOGyjFm3.js"));
+  assert.ok(
+    descriptor.pattern.test(
+      "app-initial~app-main~remote-conversation-page~plugin-detail-page~new-thread-panel-page~appg~ijdupmx5-CdYgxe-b.js",
+    ),
+  );
   assert.equal(descriptor.pattern.test("service-tier-icons-CsNhab5W.js"), false);
 });
 
@@ -846,6 +851,11 @@ test("subagent nickname metadata descriptor follows upstream metadata bundle nam
 
   assert.ok(descriptor.pattern.test("app-server-manager-signals-BOGyjFm3.js"));
   assert.ok(descriptor.pattern.test("use-host-config-Dpd_LQBD.js"));
+  assert.ok(
+    descriptor.pattern.test(
+      "app-initial~app-main~remote-conversation-page~plugin-detail-page~new-thread-panel-page~appg~ijdupmx5-CdYgxe-b.js",
+    ),
+  );
   assert.equal(descriptor.pattern.test("thread-context-inputs-D5uMjcUB.js"), false);
 });
 
@@ -2349,6 +2359,30 @@ test("keeps avatar overlay interactivity working after native presentation drift
   assert.match(patched, /this\.setWindowBounds\(e,o\.windowBounds,n,r\),this\.sendLayoutToRenderer\(e,i\),process\.platform===`linux`&&this\.applyPointerInteractivityPolicy\(\)/);
   assert.match(patched, /e\.moveTop\(\),e\.showInactive\(\),process\.platform===`linux`&&this\.codexLinuxApplyAvatarCompositorHints\(e\),process\.platform===`linux`&&this\.applyPointerInteractivityPolicy\(\),!t&&this\.isOpen\(\)&&\(this\.finishPendingPresentation\(\),this\.broadcastOpenState\(\)\)\}showWindowIfReady/);
   assert.match(patched, /this\.cancelMomentum\(\),this\.clearMovedWindowPersist\(\),this\.window=null/);
+});
+
+test("finds avatar overlay class when the route marker moves after the class body", () => {
+  const source = currentAvatarOverlayBundleFixture().replace(
+    "var rV=`/avatar-overlay`,",
+    "var rV=`/avatar-overlay-next`,",
+  ) + "let lateRoute=`/avatar-overlay`;";
+
+  const { value: patched, warnings } = captureWarns(() =>
+    applyPatchTwice(
+      applyLinuxAvatarOverlayMousePassthroughPatch,
+      source,
+    ),
+  );
+
+  assert.deepEqual(warnings, []);
+  assert.match(
+    patched,
+    /this\.dragState=new h2\(i==null\?`renderer`:`native`,c,l,a\.screen\.getDisplayNearestPoint\(s\)\.bounds\),process\.platform===`linux`&&\(this\.pointerInteractive=!0,this\.applyPointerInteractivityPolicy\(\)\)/,
+  );
+  assert.match(
+    patched,
+    /this\.setWindowBounds\(e,o\.windowBounds,n,r\),this\.sendLayoutToRenderer\(e,i\),process\.platform===`linux`&&this\.applyPointerInteractivityPolicy\(\)/,
+  );
 });
 
 test("scopes avatar overlay method matching away from unrelated earlier classes", () => {
@@ -5956,6 +5990,22 @@ test("preserves real Electron Owl feature binding when available", () => {
 
   assert.equal(sandbox.enabled, true);
   assert.equal(sandbox.disabled, false);
+});
+
+test("accepts current Electron Owl feature binding null fallback", () => {
+  const source = [
+    "var Ve=`electron_common_owl_features`,Ge={parse:e=>e};",
+    "function st(e){return String(e?.message??e).includes(Ve)&&String(e?.message??e).includes(`No such binding was linked`)}",
+    "function Ze(e){let t=Qe();if(t==null)return!1;try{return t.isOwlFeatureEnabled(e)}catch(e){if(e instanceof Error&&e.message.startsWith(`Unsupported Owl feature:`))return!1;throw e}}",
+    "function Qe(){let e=process._linkedBinding;if(typeof e!=`function`)return null;let t;try{t=e.call(process,Ve)}catch(e){if(st(e))return null;throw e}return Ge.parse(t)}",
+  ].join("");
+
+  const { value, warnings } = captureWarns(() =>
+    applyPatchTwice(applyLinuxOwlFeatureBindingFallbackPatch, source),
+  );
+
+  assert.equal(value, source);
+  assert.deepEqual(warnings, []);
 });
 
 test("patches Electron Owl feature binding fallback outside the main bundle", () => {
