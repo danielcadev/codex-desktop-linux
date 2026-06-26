@@ -79,12 +79,12 @@
           cp ${./scripts/lib/native-modules.sh} "$out/scripts/lib/native-modules.sh"
         '';
 
+        codexVersion = "26.623.31921";
         codexDmg = pkgs.fetchurl {
-          url = "https://persistent.oaistatic.com/codex-app-prod/Codex.dmg";
+          url = "https://persistent.oaistatic.com/codex-app-prod/Codex-${codexVersion}-arm64.dmg";
           hash = "sha256-/tf+iJCNU/85Voi8PikcZPapQAXt3zP2NdfiLXznpu0=";
         };
 
-        codexVersion = "26.623.31921";
         electronVersion = "42.1.0";
         electronPlatform =
           {
