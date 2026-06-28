@@ -149,14 +149,27 @@ function findExportedAlias(source, localName) {
 }
 
 function findCodexRequestExportName(source) {
-  const match = source.match(
+  let match = source.match(
     /async function\s+([A-Za-z_$][\w$]*)\(\.\.\.[^)]+\)\{let\[[^\]]+\]=[^;]+,\{params:[^}]+source:[^}]+\}=[^;]+;return\s+[A-Za-z_$][\w$]*\([^)]*\)\}/,
   );
-  if (match == null) {
-    return null;
+  if (match != null) {
+    return findExportedAlias(source, match[1]);
   }
 
-  return findExportedAlias(source, match[1]);
+  match = source.match(
+    /function\s+([A-Za-z_$][\w$]*)\(\.\.\.[^)]+\)\{let\[[^\]]+\]=[^;]+,\{params:[^}]+select:[^}]+signal:[^}]+source:[^}]+\}=[^;]+;return\s+([A-Za-z_$][\w$]*)\([^)]*\)\}/,
+  );
+  if (match != null) {
+    const [, wrapperName, rawRequestName] = match;
+    const rawRequestPattern = new RegExp(
+      `async function\\s+${rawRequestName}\\([^)]*\\)\\{[\\s\\S]{0,600}?vscode://codex/`,
+    );
+    if (rawRequestPattern.test(source)) {
+      return findExportedAlias(source, wrapperName);
+    }
+  }
+
+  return null;
 }
 
 function findCodexRequestWebviewAsset(webviewAssetsDir) {
@@ -173,10 +186,16 @@ function findCodexRequestWebviewAsset(webviewAssetsDir) {
     return { assetName: legacyAsset, exportName: "n" };
   }
 
-  const modernCandidates = fs
+  const settingStorageCandidates = fs
     .readdirSync(webviewAssetsDir)
     .filter((name) => regexpTest(/^setting-storage-.*\.js$/, name))
     .sort();
+  const allRequestCandidates = fs
+    .readdirSync(webviewAssetsDir)
+    .filter((name) => regexpTest(/\.js$/, name))
+    .sort()
+    .filter((name) => !settingStorageCandidates.includes(name));
+  const modernCandidates = [...settingStorageCandidates, ...allRequestCandidates];
   for (const candidate of modernCandidates) {
     const source = readWebviewAsset(webviewAssetsDir, candidate);
     if (!source.includes("vscode://codex/")) {

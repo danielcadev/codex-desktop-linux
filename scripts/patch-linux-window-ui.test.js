@@ -1167,8 +1167,8 @@ function createNativeKeyboardShortcutsSettingsFixture() {
     'import{s as s}from"./chunk-A.js";function n(){return{}}function t(){return{jsx(){},jsxs(){},Fragment:"Fragment"}}react.transitional.element;export{n,t};',
   );
   writeAsset(
-    "setting-storage-A.js",
-    'async function requestCodex(...args){let[request]=args,{params:params,source:source}=request;return send("vscode://codex/",params)}export{requestCodex as z};',
+    "shared-app-A.js",
+    'function requestCodex(...args){let[method,request]=args,{params:params,select:select,signal:signal,source:source}=request??{};return rawCodex(method,params,select,signal,source)}async function rawCodex(method,params,select,signal,source){let result=(await transport.post(`vscode://codex/${method}`,JSON.stringify(params),headers(source),signal)).body;return select?select(result):result}export{requestCodex as z};',
   );
   writeAsset("general-settings-A.js", "hotkey-window-hotkey-state");
   writeAsset("toggle-A.js", "export{t};");
@@ -1200,10 +1200,10 @@ function createModernNativeKeyboardShortcutsSettingsFixture() {
     fs.writeFileSync(path.join(assetsDir, name), source, "utf8");
   };
 
-  writeAsset("chunk-A.js", "");
+  writeAsset("rolldown-runtime-A.js", "function n(e){return e}function s(e){return e}export{n,s};");
   writeAsset(
-    "jsx-runtime-A.js",
-    'import{s as s}from"./chunk-A.js";function n(){return{}}function t(){return{jsx(){},jsxs(){},Fragment:"Fragment"}}react.transitional.element;export{n,t};',
+    "shared-runtime-A.js",
+    'import{s as s}from"./rolldown-runtime-A.js";function jsxFactory(){return{jsx(){},jsxs(){},Fragment:"Fragment"}}function reactFactory(){return{useState(){},useCallback(){},useEffect(){}}}function memoCache(){}export{jsxFactory as I,memoCache as L,reactFactory as R};',
   );
   writeAsset(
     "setting-storage-A.js",
@@ -1217,7 +1217,16 @@ function createModernNativeKeyboardShortcutsSettingsFixture() {
   writeAsset("settings-content-layout-A.js", "export{n,r,t};");
   writeAsset("settings-group-A.js", "export{n,t};");
   writeAsset("settings-surface-A.js", "export{t};");
-  writeAsset("keyboard-shortcuts-settings-A.js", "slug:`keyboard-shortcuts`");
+  writeAsset(
+    "keyboard-shortcuts-settings-A.js",
+    [
+      'import{n as __module,s as __toESM}from"./rolldown-runtime-A.js";',
+      'import{I as __jsxFactory,L as __memoCache,R as __reactFactory}from"./shared-runtime-A.js";',
+      "function KeyboardShortcutsSettings(){let t=(0,React.useState)(null);return (0,$.jsx)(`div`,{children:t})}",
+      "var React,$;__module(()=>{React=__toESM(__reactFactory(),1),$=__jsxFactory()})();",
+      "slug:`keyboard-shortcuts`;export{KeyboardShortcutsSettings};",
+    ].join(""),
+  );
   writeAsset(
     "settings-page-A.js",
     [
@@ -1227,6 +1236,19 @@ function createModernNativeKeyboardShortcutsSettingsFixture() {
       "var Qn=[{key:`app`,slugs:[`general-settings`,`profile`,`keyboard-shortcuts`]}];",
       "function visible(e){switch(e.slug){case`general-settings`:case`agent`:case`personalization`:return!0;case`keyboard-shortcuts`:return!0}}",
       "function loading(H){let W=!1;if(H)bb0:switch(H.slug){case`appearance`:case`general-settings`:case`agent`:case`git-settings`:case`data-controls`:case`personalization`:W=!1;break bb0;case`keyboard-shortcuts`:W=!1;break bb0}return W}",
+    ].join(""),
+  );
+  writeAsset(
+    "app-initial~app-main~page~remote-conversation-page~new-thread-panel-page~settings-page~shared-A.js",
+    settingsSharedBundleFixture(),
+  );
+  writeAsset(
+    "app-initial~app-main~remote-conversation-page~settings-page~hotkey-window-thread-page~mcp-s-A.js",
+    [
+      "var c,l=e((()=>{c=`general-settings.import.profile.keyboard-shortcuts.codex-micro.appshots.appearance.pets.agent.git-settings.data-controls.cloud-settings.cloud-environments.code-review.personalization.usage.browser-use.computer-use.local-environments.worktrees.environments.mcp-settings.hooks-settings.connections.plugins-settings.skills-settings`.split(`.`)})),u,d,f,p=e((()=>{",
+      "l(),u=`general-settings`,d=function(e){return e.String=`string`,e.Array=`array`,e.Record=`record`,e}({}),",
+      "f=[{slug:`general-settings`},{slug:`import`},{slug:`profile`},{slug:`appearance`},{slug:`pets`},{slug:`appshots`},{slug:`git-settings`},{slug:`connections`},{slug:`cloud-settings`},{slug:`cloud-environments`},{slug:`code-review`},{slug:`local-environments`},{slug:`worktrees`},{slug:`agent`},{slug:`personalization`},{slug:`keyboard-shortcuts`},{slug:`usage`},{slug:`browser-use`},{slug:`computer-use`},{slug:`mcp-settings`},{slug:`hooks-settings`},{slug:`plugins-settings`},{slug:`skills-settings`},{slug:`data-controls`}]",
+      "}));",
     ].join(""),
   );
 
@@ -3855,13 +3877,14 @@ test("keeps Linux desktop toggles visible with native Keyboard Shortcuts", () =>
     assert.match(linuxDesktopSource, /Build information/);
     assert.match(linuxDesktopSource, /Linux source commit/);
     assert.match(linuxDesktopSource, /Copy commit/);
-    assert.match(linuxDesktopSource, /Open commit/);
+    assert.match(linuxDesktopSource, /Open on GitHub/);
+    assert.doesNotMatch(linuxDesktopSource, /Source commit URL/);
     assert.match(linuxDesktopSource, /href:url/);
     assert.match(linuxDesktopSource, /codex-linux-get-build-info/);
     assert.match(linuxDesktopSource, /codex-linux-system-tray-enabled/);
     assert.match(linuxDesktopSource, /codex-linux-auto-update-on-exit/);
     assert.match(linuxDesktopSource, /import\{r as SettingsRow\}from"\.\/settings-row-A\.js"/);
-    assert.match(linuxDesktopSource, /import\{z as __post\}from"\.\/setting-storage-A\.js"/);
+    assert.match(linuxDesktopSource, /import\{z as __post\}from"\.\/shared-app-A\.js"/);
 
     assert.match(
       fs.readFileSync(path.join(assetsDir, "settings-sections-A.js"), "utf8"),
@@ -3875,7 +3898,10 @@ test("keeps Linux desktop toggles visible with native Keyboard Shortcuts", () =>
     assert.match(appMainSource, /linux-desktop-settings-linux\.js/);
     assert.doesNotMatch(appMainSource, /keybinds-settings-linux\.js/);
     const settingsPageSource = fs.readFileSync(path.join(assetsDir, "settings-page-A.js"), "utf8");
-    assert.match(settingsPageSource, /"linux-desktop":q,"general-settings":q/);
+    assert.match(
+      settingsPageSource,
+      /"linux-desktop":codexLinuxDesktopSettings,"general-settings":q/,
+    );
     assert.match(settingsPageSource, /slugs:\[`general-settings`,`linux-desktop`,`profile`/);
     assert.match(settingsPageSource, /case`linux-desktop`:case`general-settings`/);
 
@@ -3906,6 +3932,10 @@ test("adds Linux desktop settings when native shortcuts use a consolidated setti
     assert.match(linuxDesktopSource, /Linux desktop/);
     assert.match(linuxDesktopSource, /Build information/);
     assert.match(linuxDesktopSource, /codex-linux-get-build-info/);
+    assert.match(linuxDesktopSource, /Open on GitHub/);
+    assert.match(linuxDesktopSource, /href:url/);
+    assert.doesNotMatch(linuxDesktopSource, /Source commit URL/);
+    assert.match(linuxDesktopSource, /import\{R as __reactFactory,I as __jsxFactory\}from"\.\/shared-runtime-A\.js"/);
 
     const settingsPageSource = fs.readFileSync(path.join(assetsDir, "settings-page-A.js"), "utf8");
     assert.match(settingsPageSource, /linux-desktop-settings-linux\.js/);
@@ -3913,6 +3943,26 @@ test("adds Linux desktop settings when native shortcuts use a consolidated setti
     assert.match(settingsPageSource, /=\[`general-settings`,`linux-desktop`,`profile`/);
     assert.match(settingsPageSource, /slugs:\[`general-settings`,`linux-desktop`,`profile`/);
     assert.match(settingsPageSource, /case`linux-desktop`:case`general-settings`/);
+
+    const splitSharedSource = fs.readFileSync(
+      path.join(
+        assetsDir,
+        "app-initial~app-main~page~remote-conversation-page~new-thread-panel-page~settings-page~shared-A.js",
+      ),
+      "utf8",
+    );
+    assert.match(splitSharedSource, /settings\.nav\.linux-desktop/);
+    assert.match(splitSharedSource, /settings\.section\.linux-desktop/);
+
+    const splitSectionsSource = fs.readFileSync(
+      path.join(
+        assetsDir,
+        "app-initial~app-main~remote-conversation-page~settings-page~hotkey-window-thread-page~mcp-s-A.js",
+      ),
+      "utf8",
+    );
+    assert.match(splitSectionsSource, /general-settings\.linux-desktop\.import\.profile\.keyboard-shortcuts/);
+    assert.match(splitSectionsSource, /\{slug:`linux-desktop`\},\{slug:`import`\}/);
   } finally {
     fs.rmSync(extractedDir, { recursive: true, force: true });
   }
