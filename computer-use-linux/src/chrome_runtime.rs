@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     fs::{File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
@@ -17,7 +17,10 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, Weak,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -39,12 +42,16 @@ const APP_SERVER_START_TIMEOUT: Duration = Duration::from_secs(10);
 const APP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const PROXY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_APP_SERVER_PROCESSES: usize = 16;
-const MAX_PROXY_CONNECTIONS: usize = 32;
+const MAX_PENDING_HANDSHAKES: usize = 32;
+const MAX_AUTHENTICATED_CONNECTIONS: usize = 32;
 const MAX_ACTIVE_ASSETS: usize = 32;
 const MAX_ASSET_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ASSET_CHUNK_BASE64: usize = 64 * 1024;
 const MAX_CLIENT_ID_BYTES: usize = 128;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+const PROCESS_REAPER_INTERVAL: Duration = Duration::from_millis(250);
+const UNCONNECTED_PROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+const DISCONNECTED_PROCESS_GRACE: Duration = Duration::from_secs(2);
 const MANIFEST_FILE_NAME: &str = "chrome-native-hosts-v2.json";
 const OPEN_LOCAL_FILE_METHOD: &str = "codexRuntime/openLocalFile";
 
@@ -164,11 +171,46 @@ struct FileIdentity {
 
 struct ManagedProcess {
     child: Child,
+    cleanup_deadline: Option<Instant>,
     entry_id: String,
+    instance_id: u64,
+    last_touched: Instant,
+    leases: usize,
     process_group: libc::pid_t,
     proxy_host: String,
     proxy_port: u16,
     socket_path: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessCleanupTiming {
+    disconnected_grace: Duration,
+    reaper_interval: Duration,
+    unconnected_timeout: Duration,
+}
+
+impl Default for ProcessCleanupTiming {
+    fn default() -> Self {
+        Self {
+            disconnected_grace: DISCONNECTED_PROCESS_GRACE,
+            reaper_interval: PROCESS_REAPER_INTERVAL,
+            unconnected_timeout: UNCONNECTED_PROCESS_TIMEOUT,
+        }
+    }
+}
+
+struct ProcessLease {
+    client_id: String,
+    instance_id: u64,
+    manager: Weak<RuntimeManager>,
+}
+
+impl Drop for ProcessLease {
+    fn drop(&mut self) {
+        if let Some(manager) = self.manager.upgrade() {
+            manager.release_process_lease(&self.client_id, self.instance_id);
+        }
+    }
 }
 
 struct ProxyServer {
@@ -187,9 +229,54 @@ struct TabContextAsset {
 }
 
 struct ProxyHandshakeCallback {
+    authenticated: Arc<Mutex<Option<AuthenticatedProxyConnection>>>,
+    state: ProxyConnectionState,
+}
+
+struct AuthenticatedProxyConnection {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    _process_lease: ProcessLease,
+    socket_path: PathBuf,
+}
+
+#[derive(Default)]
+struct PendingHandshakePool {
+    next_id: u64,
+    pending: VecDeque<(u64, oneshot::Sender<()>)>,
+}
+
+#[derive(Clone)]
+struct ProxyConnectionState {
     allowed_origin: String,
-    selected_client: Arc<Mutex<Option<String>>>,
+    authenticated_permits: Arc<Semaphore>,
+    manager: Arc<RuntimeManager>,
+    pending_handshakes: Arc<Mutex<PendingHandshakePool>>,
     token: String,
+}
+
+impl PendingHandshakePool {
+    fn register(&mut self) -> (u64, oneshot::Receiver<()>) {
+        if self.pending.len() >= MAX_PENDING_HANDSHAKES {
+            if let Some((_, cancel)) = self.pending.pop_front() {
+                let _ = cancel.send(());
+            }
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        let (cancel, cancelled) = oneshot::channel();
+        self.pending.push_back((id, cancel));
+        (id, cancelled)
+    }
+
+    fn remove(&mut self, id: u64) {
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|(pending_id, _)| *pending_id == id)
+        {
+            self.pending.remove(index);
+        }
+    }
 }
 
 impl Callback for ProxyHandshakeCallback {
@@ -198,23 +285,38 @@ impl Callback for ProxyHandshakeCallback {
         request: &Request,
         response: Response,
     ) -> std::result::Result<Response, ErrorResponse> {
-        match validate_proxy_request(request, &self.allowed_origin, &self.token) {
-            Ok(client_id) => {
-                *self
-                    .selected_client
-                    .lock()
-                    .expect("proxy client mutex poisoned") = Some(client_id);
-                Ok(response)
-            }
-            Err(message) => Err(forbidden_response(message)),
-        }
+        let client_id =
+            validate_proxy_request(request, &self.state.allowed_origin, &self.state.token)
+                .map_err(forbidden_response)?;
+        let permit = Arc::clone(&self.state.authenticated_permits)
+            .try_acquire_owned()
+            .map_err(|_| unavailable_response())?;
+        let (socket_path, process_lease) = self
+            .state
+            .manager
+            .acquire_process_lease(&client_id)
+            .map_err(|_| unavailable_response())?;
+        *self
+            .authenticated
+            .lock()
+            .expect("proxy connection mutex poisoned") = Some(AuthenticatedProxyConnection {
+            _permit: permit,
+            _process_lease: process_lease,
+            socket_path,
+        });
+        Ok(response)
     }
 }
 
 pub struct RuntimeManager {
     assets: Mutex<HashMap<String, TabContextAsset>>,
+    cleanup_control: Arc<(Mutex<bool>, Condvar)>,
+    cleanup_join: Mutex<Option<thread::JoinHandle<()>>>,
+    cleanup_timing: ProcessCleanupTiming,
     extension_id: Option<String>,
+    lifecycle: Mutex<()>,
     manifest_paths_override: Option<Vec<PathBuf>>,
+    next_process_instance: AtomicU64,
     processes: Mutex<HashMap<String, ManagedProcess>>,
     proxy: Mutex<Option<ProxyServer>>,
     runtime_root: PathBuf,
@@ -230,10 +332,29 @@ impl RuntimeManager {
         runtime_root: PathBuf,
         manifest_paths_override: Option<Vec<PathBuf>>,
     ) -> Self {
+        Self::with_runtime_root_and_timing(
+            extension_id,
+            runtime_root,
+            manifest_paths_override,
+            ProcessCleanupTiming::default(),
+        )
+    }
+
+    fn with_runtime_root_and_timing(
+        extension_id: Option<String>,
+        runtime_root: PathBuf,
+        manifest_paths_override: Option<Vec<PathBuf>>,
+        cleanup_timing: ProcessCleanupTiming,
+    ) -> Self {
         Self {
             assets: Mutex::new(HashMap::new()),
+            cleanup_control: Arc::new((Mutex::new(false), Condvar::new())),
+            cleanup_join: Mutex::new(None),
+            cleanup_timing,
             extension_id,
+            lifecycle: Mutex::new(()),
             manifest_paths_override,
+            next_process_instance: AtomicU64::new(1),
             processes: Mutex::new(HashMap::new()),
             proxy: Mutex::new(None),
             runtime_root,
@@ -295,8 +416,12 @@ impl RuntimeManager {
         let client_id = normalized_client_id(params.get("clientId"))?;
         let entry = select_runtime_entry(&constraints, self.manifest_paths_override.as_deref())?;
         validate_runtime_entry(&entry)?;
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("app-server lifecycle mutex poisoned");
         let (address, token) = self.ensure_proxy(&entry)?;
-        self.ensure_process(
+        self.ensure_process_locked(
             &entry,
             &constraints.extension_id,
             &client_id,
@@ -426,68 +551,138 @@ impl RuntimeManager {
         Ok((address, token))
     }
 
+    #[cfg(test)]
     fn ensure_process(
-        &self,
+        self: &Arc<Self>,
         entry: &RuntimeEntry,
         extension_id: &str,
         client_id: &str,
         proxy_port: u16,
         restart: bool,
     ) -> RuntimeResult<PathBuf> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("app-server lifecycle mutex poisoned");
+        self.ensure_process_locked(entry, extension_id, client_id, proxy_port, restart)
+    }
+
+    fn ensure_process_locked(
+        self: &Arc<Self>,
+        entry: &RuntimeEntry,
+        extension_id: &str,
+        client_id: &str,
+        proxy_port: u16,
+        restart: bool,
+    ) -> RuntimeResult<PathBuf> {
+        self.ensure_cleanup_worker()?;
         let mut processes = self
             .processes
             .lock()
             .expect("app-server process mutex poisoned");
 
-        let keep_existing = if let Some(process) = processes.get_mut(client_id) {
+        let keep_existing = if let Some(process) = processes.get(client_id) {
             process_is_reusable(process, entry, proxy_port, restart)?
         } else {
             false
         };
         if keep_existing {
-            return Ok(processes
-                .get(client_id)
-                .expect("checked process")
-                .socket_path
-                .clone());
+            let process = processes.get_mut(client_id).expect("checked process");
+            process.last_touched = Instant::now();
+            if process.leases == 0 {
+                process.cleanup_deadline =
+                    Some(Instant::now() + self.cleanup_timing.unconnected_timeout);
+            }
+            let socket_path = process.socket_path.clone();
+            return Ok(socket_path);
         }
 
-        if let Some(mut stale) = processes.remove(client_id) {
+        let stale = processes.remove(client_id);
+        drop(processes);
+        if let Some(mut stale) = stale {
             stop_managed_process(&mut stale);
         }
-        processes.retain(|_, process| match process.child.try_wait() {
-            Ok(Some(_)) => {
-                let _ = fs::remove_file(&process.socket_path);
-                false
-            }
-            Ok(None) => true,
-            Err(error) => {
-                runtime_log(&format!("app-server status check failed: {error}"));
-                true
-            }
-        });
+
+        let mut processes = self
+            .processes
+            .lock()
+            .expect("app-server process mutex poisoned");
+        let exited_clients = processes
+            .iter()
+            .filter_map(|(client_id, process)| {
+                match leader_exited_without_reaping(&process.child) {
+                    Ok(true) => Some(client_id.clone()),
+                    Ok(false) => None,
+                    Err(error) => {
+                        runtime_log(&format!("app-server status check failed: {error}"));
+                        None
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut exited_processes = exited_clients
+            .into_iter()
+            .filter_map(|client_id| processes.remove(&client_id))
+            .collect::<Vec<_>>();
+        drop(processes);
+        for process in &mut exited_processes {
+            stop_managed_process(process);
+        }
+        let mut processes = self
+            .processes
+            .lock()
+            .expect("app-server process mutex poisoned");
         if processes.len() >= MAX_APP_SERVER_PROCESSES {
-            return Err(RuntimeError::internal(
-                "Too many active Chrome sidepanel app-server processes",
-            ));
+            let idle_client = processes
+                .iter()
+                .filter(|(_, process)| process.leases == 0)
+                .min_by_key(|(_, process)| process.last_touched)
+                .map(|(client_id, _)| client_id.clone());
+            let evicted = idle_client.and_then(|client_id| processes.remove(&client_id));
+            drop(processes);
+            if let Some(mut evicted) = evicted {
+                stop_managed_process(&mut evicted);
+            } else {
+                return Err(RuntimeError::internal(
+                    "Too many active Chrome sidepanel app-server processes",
+                ));
+            }
+            processes = self
+                .processes
+                .lock()
+                .expect("app-server process mutex poisoned");
         }
 
+        let instance_id = self.next_process_instance.fetch_add(1, Ordering::Relaxed);
+        drop(processes);
         let process = start_app_server(
             entry,
             extension_id,
             client_id,
             proxy_port,
             &self.runtime_root,
+            instance_id,
+            self.cleanup_timing.unconnected_timeout,
         )?;
         let socket_path = process.socket_path.clone();
+        let mut processes = self
+            .processes
+            .lock()
+            .expect("app-server process mutex poisoned");
         if let Some(previous) = processes.insert(client_id.to_string(), process) {
             let mut previous = previous;
+            drop(processes);
             stop_managed_process(&mut previous);
+        } else {
+            drop(processes);
         }
         Ok(socket_path)
     }
 
-    fn process_socket(&self, client_id: &str) -> RuntimeResult<PathBuf> {
+    fn acquire_process_lease(
+        self: &Arc<Self>,
+        client_id: &str,
+    ) -> RuntimeResult<(PathBuf, ProcessLease)> {
         let mut processes = self
             .processes
             .lock()
@@ -495,19 +690,141 @@ impl RuntimeManager {
         let process = processes.get_mut(client_id).ok_or_else(|| {
             RuntimeError::internal("Codex app-server is not running for this sidepanel")
         })?;
-        if process
-            .child
-            .try_wait()
-            .map_err(|error| {
-                RuntimeError::internal(format!("Failed to inspect Codex app-server: {error}"))
-            })?
-            .is_some()
-        {
+        if leader_exited_without_reaping(&process.child).map_err(|error| {
+            RuntimeError::internal(format!("Failed to inspect Codex app-server: {error}"))
+        })? {
+            let mut process = processes
+                .remove(client_id)
+                .expect("checked app-server process");
+            drop(processes);
+            stop_managed_process(&mut process);
             return Err(RuntimeError::internal(
                 "Codex app-server exited before the sidepanel connected",
             ));
         }
-        Ok(process.socket_path.clone())
+        process.leases = process.leases.checked_add(1).ok_or_else(|| {
+            RuntimeError::internal("Too many app-server leases for this sidepanel")
+        })?;
+        process.cleanup_deadline = None;
+        process.last_touched = Instant::now();
+        let socket_path = process.socket_path.clone();
+        let instance_id = process.instance_id;
+        Ok((
+            socket_path,
+            ProcessLease {
+                client_id: client_id.to_string(),
+                instance_id,
+                manager: Arc::downgrade(self),
+            },
+        ))
+    }
+
+    fn release_process_lease(&self, client_id: &str, instance_id: u64) {
+        let mut processes = self
+            .processes
+            .lock()
+            .expect("app-server process mutex poisoned");
+        let Some(process) = processes.get_mut(client_id) else {
+            return;
+        };
+        if process.instance_id != instance_id {
+            return;
+        }
+        if process.leases == 0 {
+            runtime_log("app-server lease underflow prevented");
+            return;
+        }
+        process.leases -= 1;
+        process.last_touched = Instant::now();
+        if process.leases == 0 {
+            process.cleanup_deadline =
+                Some(Instant::now() + self.cleanup_timing.disconnected_grace);
+            self.cleanup_control.1.notify_all();
+        }
+    }
+
+    fn ensure_cleanup_worker(self: &Arc<Self>) -> RuntimeResult<()> {
+        let mut join = self
+            .cleanup_join
+            .lock()
+            .expect("app-server cleanup worker mutex poisoned");
+        if join.as_ref().is_some_and(|join| !join.is_finished()) {
+            return Ok(());
+        }
+        if let Some(finished) = join.take() {
+            let _ = finished.join();
+        }
+        if *self
+            .cleanup_control
+            .0
+            .lock()
+            .expect("app-server cleanup state mutex poisoned")
+        {
+            return Err(RuntimeError::internal(
+                "Codex app-server runtime is shutting down",
+            ));
+        }
+
+        let manager = Arc::downgrade(self);
+        let control = Arc::clone(&self.cleanup_control);
+        let interval = self.cleanup_timing.reaper_interval;
+        let worker = thread::Builder::new()
+            .name("codex-app-server-reaper".to_string())
+            .spawn(move || loop {
+                let (shutdown, wake) = &*control;
+                let shutdown = shutdown
+                    .lock()
+                    .expect("app-server cleanup state mutex poisoned");
+                let (shutdown, _) = wake
+                    .wait_timeout_while(shutdown, interval, |shutdown| !*shutdown)
+                    .expect("app-server cleanup wait poisoned");
+                if *shutdown {
+                    break;
+                }
+                drop(shutdown);
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.reap_idle_processes();
+            })
+            .map_err(|error| {
+                RuntimeError::internal(format!("Failed to start app-server reaper: {error}"))
+            })?;
+        *join = Some(worker);
+        Ok(())
+    }
+
+    fn reap_idle_processes(&self) {
+        let now = Instant::now();
+        let mut processes = self
+            .processes
+            .lock()
+            .expect("app-server process mutex poisoned");
+        let expired_clients = processes
+            .iter()
+            .filter_map(|(client_id, process)| {
+                let leader_exited = match leader_exited_without_reaping(&process.child) {
+                    Ok(exited) => exited,
+                    Err(error) => {
+                        runtime_log(&format!("app-server status check failed: {error}"));
+                        false
+                    }
+                };
+                let lease_expired = process.leases == 0
+                    && process
+                        .cleanup_deadline
+                        .is_some_and(|deadline| deadline <= now);
+                (leader_exited || lease_expired).then(|| client_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let mut expired_processes = expired_clients
+            .into_iter()
+            .filter_map(|client_id| processes.remove(&client_id))
+            .collect::<Vec<_>>();
+        drop(processes);
+        for process in &mut expired_processes {
+            stop_managed_process(process);
+        }
     }
 
     fn create_asset(&self, params: &Value) -> RuntimeResult<Value> {
@@ -660,6 +977,19 @@ impl RuntimeManager {
     }
 
     pub fn shutdown(&self) {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .expect("app-server lifecycle mutex poisoned");
+        {
+            let mut shutdown = self
+                .cleanup_control
+                .0
+                .lock()
+                .expect("app-server cleanup state mutex poisoned");
+            *shutdown = true;
+            self.cleanup_control.1.notify_all();
+        }
         if let Some(mut proxy) = self
             .proxy
             .lock()
@@ -668,14 +998,23 @@ impl RuntimeManager {
         {
             stop_proxy(&mut proxy);
         }
-        let mut processes = self
-            .processes
+        if let Some(worker) = self
+            .cleanup_join
             .lock()
-            .expect("app-server process mutex poisoned");
-        for process in processes.values_mut() {
-            stop_managed_process(process);
+            .expect("app-server cleanup worker mutex poisoned")
+            .take()
+        {
+            let _ = worker.join();
         }
-        processes.clear();
+        let processes = std::mem::take(
+            &mut *self
+                .processes
+                .lock()
+                .expect("app-server process mutex poisoned"),
+        );
+        for mut process in processes.into_values() {
+            stop_managed_process(&mut process);
+        }
         let assets = std::mem::take(
             &mut *self
                 .assets
@@ -697,36 +1036,37 @@ impl RuntimeManager {
 
     #[cfg(test)]
     pub(crate) fn running_process_count(&self) -> usize {
-        let mut processes = self
+        let processes = self
             .processes
             .lock()
             .expect("app-server process mutex poisoned");
         processes
-            .values_mut()
-            .map(|process| process.child.try_wait().ok().flatten().is_none())
+            .values()
+            .map(|process| {
+                leader_exited_without_reaping(&process.child).is_ok_and(|exited| !exited)
+            })
             .filter(|running| *running)
             .count()
     }
 }
 
 fn process_is_reusable(
-    process: &mut ManagedProcess,
+    process: &ManagedProcess,
     entry: &RuntimeEntry,
     proxy_port: u16,
     restart: bool,
 ) -> RuntimeResult<bool> {
-    Ok(!restart
-        && process.entry_id == entry.entry_id
-        && process.proxy_host == entry.proxy_host
-        && process.proxy_port == proxy_port
-        && process
-            .child
-            .try_wait()
-            .map_err(|error| {
-                RuntimeError::internal(format!("Failed to inspect Codex app-server: {error}"))
-            })?
-            .is_none()
-        && socket_is_ready(&process.socket_path))
+    if restart
+        || process.entry_id != entry.entry_id
+        || process.proxy_host != entry.proxy_host
+        || process.proxy_port != proxy_port
+    {
+        return Ok(false);
+    }
+    let exited = leader_exited_without_reaping(&process.child).map_err(|error| {
+        RuntimeError::internal(format!("Failed to inspect Codex app-server: {error}"))
+    })?;
+    Ok(!exited && socket_is_ready(&process.socket_path))
 }
 
 impl RuntimeEntry {
@@ -910,7 +1250,8 @@ fn validate_owned_dir(path: &Path, require_user_owner: bool) -> RuntimeResult<()
     if !path.is_absolute() {
         return Err(required_path_error("directory"));
     }
-    let metadata = fs::metadata(path).map_err(|_| required_path_error("directory"))?;
+    let canonical = fs::canonicalize(path).map_err(|_| required_path_error("directory"))?;
+    let metadata = fs::metadata(&canonical).map_err(|_| required_path_error("directory"))?;
     if !metadata.is_dir() || has_unsafe_write_permissions(&metadata) {
         return Err(required_path_error("directory"));
     }
@@ -920,6 +1261,7 @@ fn validate_owned_dir(path: &Path, require_user_owner: bool) -> RuntimeResult<()
     {
         return Err(required_path_error("directory"));
     }
+    validate_trusted_parent_chain(&canonical)?;
     Ok(())
 }
 
@@ -934,18 +1276,22 @@ fn validate_trusted_parent_chain(path: &Path) -> RuntimeResult<()> {
     let euid = unsafe { libc::geteuid() };
     for parent in path.ancestors().skip(1) {
         let metadata = fs::symlink_metadata(parent).map_err(|_| required_path_error("parent"))?;
-        if !metadata.is_dir()
-            || metadata.file_type().is_symlink()
-            || has_unsafe_write_permissions(&metadata)
-            || (metadata.uid() != euid && metadata.uid() != 0)
-        {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(required_path_error("parent"));
         }
-        if metadata.uid() == euid || metadata.uid() == 0 {
-            return Ok(());
+        if metadata.uid() != euid && metadata.uid() != 0 {
+            return Err(required_path_error("parent"));
+        }
+        if has_unsafe_write_permissions(&metadata) && !is_root_owned_sticky_directory(&metadata) {
+            return Err(required_path_error("parent"));
         }
     }
-    Err(required_path_error("parent"))
+    Ok(())
+}
+
+fn is_root_owned_sticky_directory(metadata: &fs::Metadata) -> bool {
+    let mode = metadata.permissions().mode();
+    metadata.uid() == 0 && mode & libc::S_ISVTX != 0 && mode & 0o002 != 0
 }
 
 fn current_executable_identity() -> RuntimeResult<FileIdentity> {
@@ -1061,6 +1407,8 @@ fn start_app_server(
     client_id: &str,
     proxy_port: u16,
     runtime_root: &Path,
+    instance_id: u64,
+    unconnected_timeout: Duration,
 ) -> RuntimeResult<ManagedProcess> {
     prepare_private_dir(runtime_root).map_err(|error| {
         RuntimeError::internal(format!(
@@ -1137,18 +1485,34 @@ fn start_app_server(
     let process_group = child.id() as libc::pid_t;
     let deadline = Instant::now() + APP_SERVER_START_TIMEOUT;
     while Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let _ = fs::remove_file(&socket_path);
-                return Err(RuntimeError::internal(format!(
-                    "Codex app-server exited before becoming ready ({status})"
-                )));
+        match leader_exited_without_reaping(&child) {
+            Ok(true) => {
+                let mut process = ManagedProcess {
+                    child,
+                    cleanup_deadline: None,
+                    entry_id: entry.entry_id.clone(),
+                    instance_id,
+                    last_touched: Instant::now(),
+                    leases: 0,
+                    process_group,
+                    proxy_host: entry.proxy_host.clone(),
+                    proxy_port,
+                    socket_path,
+                };
+                stop_managed_process(&mut process);
+                return Err(RuntimeError::internal(
+                    "Codex app-server exited before becoming ready",
+                ));
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 let mut process = ManagedProcess {
                     child,
+                    cleanup_deadline: None,
                     entry_id: entry.entry_id.clone(),
+                    instance_id,
+                    last_touched: Instant::now(),
+                    leases: 0,
                     process_group,
                     proxy_host: entry.proxy_host.clone(),
                     proxy_port,
@@ -1161,9 +1525,14 @@ fn start_app_server(
             }
         }
         if socket_is_ready(&socket_path) {
+            let now = Instant::now();
             return Ok(ManagedProcess {
                 child,
+                cleanup_deadline: Some(now + unconnected_timeout),
                 entry_id: entry.entry_id.clone(),
+                instance_id,
+                last_touched: now,
+                leases: 0,
                 process_group,
                 proxy_host: entry.proxy_host.clone(),
                 proxy_port,
@@ -1174,7 +1543,11 @@ fn start_app_server(
     }
     let mut process = ManagedProcess {
         child,
+        cleanup_deadline: None,
         entry_id: entry.entry_id.clone(),
+        instance_id,
+        last_touched: Instant::now(),
+        leases: 0,
         process_group,
         proxy_host: entry.proxy_host.clone(),
         proxy_port,
@@ -1187,25 +1560,95 @@ fn start_app_server(
 }
 
 fn stop_managed_process(process: &mut ManagedProcess) {
-    if process.child.try_wait().ok().flatten().is_none() {
-        unsafe {
-            libc::kill(-process.process_group, libc::SIGTERM);
-        }
-        let deadline = Instant::now() + APP_SERVER_STOP_TIMEOUT;
-        while Instant::now() < deadline {
-            if process.child.try_wait().ok().flatten().is_some() {
-                break;
-            }
+    let _ = signal_process_group(process.process_group, libc::SIGTERM);
+    let deadline = Instant::now() + APP_SERVER_STOP_TIMEOUT;
+    while Instant::now() < deadline
+        && process_group_has_live_members(process.process_group).unwrap_or(true)
+    {
+        thread::sleep(Duration::from_millis(25));
+    }
+    if process_group_has_live_members(process.process_group).unwrap_or(true) {
+        let _ = signal_process_group(process.process_group, libc::SIGKILL);
+        let kill_deadline = Instant::now() + APP_SERVER_STOP_TIMEOUT;
+        while Instant::now() < kill_deadline
+            && process_group_has_live_members(process.process_group).unwrap_or(true)
+        {
             thread::sleep(Duration::from_millis(25));
-        }
-        if process.child.try_wait().ok().flatten().is_none() {
-            unsafe {
-                libc::kill(-process.process_group, libc::SIGKILL);
-            }
         }
     }
     let _ = process.child.wait();
     let _ = fs::remove_file(&process.socket_path);
+}
+
+fn leader_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    loop {
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    let info = unsafe { info.assume_init() };
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn signal_process_group(process_group: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(-process_group, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn process_group_has_live_members(process_group: libc::pid_t) -> io::Result<bool> {
+    for entry in fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, suffix)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = suffix.split_whitespace();
+        let Some(state) = fields.next() else { continue };
+        let _parent_pid = fields.next();
+        let Some(member_group) = fields
+            .next()
+            .and_then(|value| value.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if member_group == process_group && state != "Z" && state != "X" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn socket_is_ready(path: &Path) -> bool {
@@ -1237,24 +1680,36 @@ async fn run_proxy(
             return;
         }
     };
-    let connection_permits = Arc::new(Semaphore::new(MAX_PROXY_CONNECTIONS));
+    let pending_handshakes = Arc::new(Mutex::new(PendingHandshakePool::default()));
+    let authenticated_permits = Arc::new(Semaphore::new(MAX_AUTHENTICATED_CONNECTIONS));
+    let connection_state = ProxyConnectionState {
+        allowed_origin,
+        authenticated_permits,
+        manager,
+        pending_handshakes: Arc::clone(&pending_handshakes),
+        token,
+    };
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
             accepted = listener.accept() => {
                 let Ok((stream, _)) = accepted else { continue };
-                let Ok(permit) = Arc::clone(&connection_permits).try_acquire_owned() else {
-                    continue;
-                };
-                let manager = Arc::clone(&manager);
-                let allowed_origin = allowed_origin.clone();
-                let token = token.clone();
+                let (handshake_id, cancelled) = pending_handshakes
+                    .lock()
+                    .expect("pending handshake pool mutex poisoned")
+                    .register();
+                let connection_state = connection_state.clone();
                 tokio::spawn(async move {
-                    let _permit = permit;
-                    if let Err(error) = handle_proxy_connection(stream, manager, &allowed_origin, &token).await {
+                    if let Err(error) = handle_proxy_connection(
+                        stream,
+                        handshake_id,
+                        cancelled,
+                        connection_state,
+                    ).await {
                         runtime_log(&format!("app-server proxy connection failed: {error}"));
                     }
                 });
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -1262,40 +1717,50 @@ async fn run_proxy(
 
 async fn handle_proxy_connection(
     stream: tokio::net::TcpStream,
-    manager: Arc<RuntimeManager>,
-    allowed_origin: &str,
-    token: &str,
+    handshake_id: u64,
+    mut cancelled: oneshot::Receiver<()>,
+    state: ProxyConnectionState,
 ) -> Result<()> {
-    let selected_client = Arc::new(Mutex::new(None::<String>));
-    let browser = tokio::time::timeout(
-        PROXY_HANDSHAKE_TIMEOUT,
-        accept_hdr_async(
-            stream,
-            ProxyHandshakeCallback {
-                allowed_origin: allowed_origin.to_string(),
-                selected_client: Arc::clone(&selected_client),
-                token: token.to_string(),
-            },
-        ),
-    )
-    .await
-    .context("browser WebSocket handshake timed out")?
-    .context("browser WebSocket handshake failed")?;
-    let client_id = selected_client
+    let authenticated = Arc::new(Mutex::new(None::<AuthenticatedProxyConnection>));
+    let handshake = tokio::select! {
+        _ = &mut cancelled => {
+            state.pending_handshakes
+                .lock()
+                .expect("pending handshake pool mutex poisoned")
+                .remove(handshake_id);
+            return Ok(());
+        }
+        result = tokio::time::timeout(
+            PROXY_HANDSHAKE_TIMEOUT,
+            accept_hdr_async(
+                stream,
+                ProxyHandshakeCallback {
+                    authenticated: Arc::clone(&authenticated),
+                    state: state.clone(),
+                },
+            ),
+        ) => result,
+    };
+    state
+        .pending_handshakes
         .lock()
-        .expect("proxy client mutex poisoned")
+        .expect("pending handshake pool mutex poisoned")
+        .remove(handshake_id);
+    let browser = handshake
+        .context("browser WebSocket handshake timed out")?
+        .context("browser WebSocket handshake failed")?;
+    let authenticated = authenticated
+        .lock()
+        .expect("proxy connection mutex poisoned")
         .take()
-        .context("proxy client id was not selected")?;
-    let socket_path = manager
-        .process_socket(&client_id)
-        .map_err(|error| anyhow::anyhow!(error.message))?;
+        .context("proxy connection was not authenticated")?;
     let unix = tokio::time::timeout(
         PROXY_HANDSHAKE_TIMEOUT,
-        TokioUnixStream::connect(&socket_path),
+        TokioUnixStream::connect(&authenticated.socket_path),
     )
     .await
     .context("app-server Unix socket connection timed out")?
-    .with_context(|| format!("failed to connect {}", socket_path.display()))?;
+    .with_context(|| format!("failed to connect {}", authenticated.socket_path.display()))?;
     let (app_server, _) = tokio::time::timeout(
         PROXY_HANDSHAKE_TIMEOUT,
         client_async("ws://localhost/rpc", unix),
@@ -1382,6 +1847,12 @@ fn forbidden_response(message: &'static str) -> ErrorResponse {
     };
     let mut response = ErrorResponse::new(Some(message.to_string()));
     *response.status_mut() = status;
+    response
+}
+
+fn unavailable_response() -> ErrorResponse {
+    let mut response = ErrorResponse::new(Some("Unavailable".to_string()));
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
     response
 }
 
@@ -1607,6 +2078,7 @@ pub fn is_runtime_request(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream as StdTcpStream;
     use std::os::unix::net::UnixListener;
 
     #[test]
@@ -1665,6 +2137,100 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_limit_is_checked_only_after_request_validation() {
+        let root = test_root("authenticated-proxy-limit");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.clone(),
+            None,
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let client_id = "sidepanel-window-auth-limit";
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                client_id,
+                41000,
+                false,
+            )
+            .unwrap();
+        let state = ProxyConnectionState {
+            allowed_origin: "chrome-extension://abcdefghijklmnopabcdefghijklmnop".to_string(),
+            authenticated_permits: Arc::new(Semaphore::new(1)),
+            manager: Arc::clone(&manager),
+            pending_handshakes: Arc::new(Mutex::new(PendingHandshakePool::default())),
+            token: "secret".to_string(),
+        };
+        let request = |origin: &'static str| {
+            Request::builder()
+                .uri(format!("/?token=secret&clientId={client_id}"))
+                .header("origin", origin)
+                .body(())
+                .unwrap()
+        };
+
+        let first = Arc::new(Mutex::new(None));
+        assert!(ProxyHandshakeCallback {
+            authenticated: Arc::clone(&first),
+            state: state.clone(),
+        }
+        .on_request(
+            &request("chrome-extension://abcdefghijklmnopabcdefghijklmnop"),
+            Response::default(),
+        )
+        .is_ok());
+
+        let invalid = ProxyHandshakeCallback {
+            authenticated: Arc::new(Mutex::new(None)),
+            state: state.clone(),
+        }
+        .on_request(&request("https://example.com"), Response::default())
+        .unwrap_err();
+        assert_eq!(invalid.status(), StatusCode::FORBIDDEN);
+
+        let over_limit = ProxyHandshakeCallback {
+            authenticated: Arc::new(Mutex::new(None)),
+            state: state.clone(),
+        }
+        .on_request(
+            &request("chrome-extension://abcdefghijklmnopabcdefghijklmnop"),
+            Response::default(),
+        )
+        .unwrap_err();
+        assert_eq!(over_limit.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        drop(
+            first
+                .lock()
+                .expect("proxy connection mutex poisoned")
+                .take(),
+        );
+        let after_release = Arc::new(Mutex::new(None));
+        assert!(ProxyHandshakeCallback {
+            authenticated: Arc::clone(&after_release),
+            state,
+        }
+        .on_request(
+            &request("chrome-extension://abcdefghijklmnopabcdefghijklmnop"),
+            Response::default(),
+        )
+        .is_ok());
+        drop(
+            after_release
+                .lock()
+                .expect("proxy connection mutex poisoned")
+                .take(),
+        );
+
+        manager.shutdown();
+    }
+
+    #[test]
     fn proxy_reuses_an_available_port_when_the_requested_port_is_busy() {
         let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let requested_port = occupied.local_addr().unwrap().port();
@@ -1686,6 +2252,338 @@ mod tests {
 
         manager.shutdown();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn authenticated_handshake_displaces_stalled_pre_auth_connections() {
+        let root = test_root("proxy-handshake-exhaustion");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.clone(),
+            None,
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        entry.proxy_port = 0;
+        let (address, token) = manager.ensure_proxy(&entry).unwrap();
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                "sidepanel-window-99",
+                address.port(),
+                false,
+            )
+            .unwrap();
+
+        let stalled = (0..MAX_PENDING_HANDSHAKES)
+            .map(|_| StdTcpStream::connect(address).unwrap())
+            .collect::<Vec<_>>();
+        thread::sleep(Duration::from_millis(100));
+
+        let mut legitimate = StdTcpStream::connect(address).unwrap();
+        legitimate
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            legitimate,
+            "GET /?token={token}&clientId=sidepanel-window-99 HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: chrome-extension://abcdefghijklmnopabcdefghijklmnop\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = [0_u8; 1024];
+        let response_len = legitimate.read(&mut response).unwrap_or(0);
+        assert!(
+            String::from_utf8_lossy(&response[..response_len]).contains("101 Switching Protocols"),
+            "legitimate authenticated handshake was not admitted"
+        );
+        assert_eq!(
+            manager
+                .processes
+                .lock()
+                .expect("app-server process mutex poisoned")
+                .get("sidepanel-window-99")
+                .expect("authenticated app-server process")
+                .leases,
+            1
+        );
+
+        manager.shutdown();
+        drop(stalled);
+    }
+
+    #[test]
+    fn unconnected_processes_are_reclaimed_at_capacity() {
+        let root = test_root("unconnected-process-capacity");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+        ));
+        let mut entry = test_entry();
+        entry.entry_id = "capacity-entry".to_string();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+
+        for index in 0..MAX_APP_SERVER_PROCESSES {
+            manager
+                .ensure_process(
+                    &entry,
+                    "abcdefghijklmnopabcdefghijklmnop",
+                    &format!("sidepanel-window-{index}"),
+                    41000,
+                    false,
+                )
+                .unwrap();
+        }
+        assert!(manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                "sidepanel-window-over-capacity",
+                41000,
+                false,
+            )
+            .is_ok());
+        assert_eq!(manager.running_process_count(), MAX_APP_SERVER_PROCESSES);
+
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unconnected_process_is_reaped_after_its_deadline() {
+        let root = test_root("unconnected-process-deadline");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root_and_timing(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+            test_cleanup_timing(),
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                "sidepanel-window-unconnected",
+                41000,
+                false,
+            )
+            .unwrap();
+        assert_eq!(manager.running_process_count(), 1);
+        wait_for_process_count(&manager, 0);
+
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reconnect_cancels_pending_process_cleanup() {
+        let root = test_root("reconnect-cleanup-race");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root_and_timing(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+            test_cleanup_timing(),
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let client_id = "sidepanel-window-reconnect";
+
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                client_id,
+                41000,
+                false,
+            )
+            .unwrap();
+        let (_, first_lease) = manager.acquire_process_lease(client_id).unwrap();
+        drop(first_lease);
+        thread::sleep(Duration::from_millis(40));
+        let (_, second_lease) = manager.acquire_process_lease(client_id).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(manager.running_process_count(), 1);
+
+        drop(second_lease);
+        wait_for_process_count(&manager, 0);
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn process_cleanup_waits_for_the_last_connection_lease() {
+        let root = test_root("last-connection-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root_and_timing(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+            test_cleanup_timing(),
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let client_id = "sidepanel-window-two-connections";
+
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                client_id,
+                41000,
+                false,
+            )
+            .unwrap();
+        let (_, first_lease) = manager.acquire_process_lease(client_id).unwrap();
+        let (_, second_lease) = manager.acquire_process_lease(client_id).unwrap();
+        drop(first_lease);
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(manager.running_process_count(), 1);
+
+        drop(second_lease);
+        wait_for_process_count(&manager, 0);
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_processes_are_not_evicted_at_capacity() {
+        let root = test_root("active-process-capacity");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let mut leases = Vec::new();
+
+        for index in 0..MAX_APP_SERVER_PROCESSES {
+            let client_id = format!("sidepanel-window-active-{index}");
+            manager
+                .ensure_process(
+                    &entry,
+                    "abcdefghijklmnopabcdefghijklmnop",
+                    &client_id,
+                    41000,
+                    false,
+                )
+                .unwrap();
+            leases.push(manager.acquire_process_lease(&client_id).unwrap().1);
+        }
+        assert!(manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                "sidepanel-window-no-idle-capacity",
+                41000,
+                false,
+            )
+            .is_err());
+        assert_eq!(manager.running_process_count(), MAX_APP_SERVER_PROCESSES);
+
+        drop(leases);
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_lease_cannot_release_a_restarted_process() {
+        let root = test_root("stale-process-lease");
+        fs::create_dir_all(&root).unwrap();
+        let fake_cli = fake_socket_app_server(&root);
+        let manager = Arc::new(RuntimeManager::with_runtime_root_and_timing(
+            Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+            root.join("runtime"),
+            None,
+            test_cleanup_timing(),
+        ));
+        let mut entry = test_entry();
+        entry.paths.codex_cli_path = fake_cli;
+        entry.paths.codex_home = root.clone();
+        let client_id = "sidepanel-window-restart";
+
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                client_id,
+                41000,
+                false,
+            )
+            .unwrap();
+        let (_, stale_lease) = manager.acquire_process_lease(client_id).unwrap();
+        manager
+            .ensure_process(
+                &entry,
+                "abcdefghijklmnopabcdefghijklmnop",
+                client_id,
+                41000,
+                true,
+            )
+            .unwrap();
+        let (_, current_lease) = manager.acquire_process_lease(client_id).unwrap();
+        drop(stale_lease);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(manager.running_process_count(), 1);
+
+        drop(current_lease);
+        wait_for_process_count(&manager, 0);
+        manager.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_serializes_with_a_new_process_start() {
+        for index in 0..8 {
+            let root = test_root(&format!("shutdown-start-race-{index}"));
+            fs::create_dir_all(&root).unwrap();
+            let fake_cli = fake_socket_app_server(&root);
+            let manager = Arc::new(RuntimeManager::with_runtime_root(
+                Some("abcdefghijklmnopabcdefghijklmnop".to_string()),
+                root.join("runtime"),
+                None,
+            ));
+            let mut entry = test_entry();
+            entry.paths.codex_cli_path = fake_cli;
+            entry.paths.codex_home = root.clone();
+            let worker_manager = Arc::clone(&manager);
+            let worker = thread::spawn(move || {
+                worker_manager.ensure_process(
+                    &entry,
+                    "abcdefghijklmnopabcdefghijklmnop",
+                    "sidepanel-window-shutdown-race",
+                    41000,
+                    false,
+                )
+            });
+
+            manager.shutdown();
+            let result = worker.join().unwrap();
+            if let Err(error) = result {
+                assert_eq!(error.message, "Codex app-server runtime is shutting down");
+            }
+            assert_eq!(manager.running_process_count(), 0);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -1953,6 +2851,38 @@ mod tests {
     }
 
     #[test]
+    fn runtime_paths_reject_an_unsafe_grandparent_directory() {
+        let root = test_root("unsafe-grandparent");
+        let unsafe_grandparent = root.join("shared");
+        let safe_parent = unsafe_grandparent.join("private");
+        fs::create_dir_all(&safe_parent).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&unsafe_grandparent, fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&safe_parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = safe_parent.join("codex");
+        fs::write(&executable, "binary").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(validate_owned_file(&executable, true).is_err());
+        assert!(validate_owned_dir(&safe_parent, true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn runtime_paths_accept_a_safe_tree_below_root_owned_sticky_tmp() {
+        let root = test_root("safe-sticky-ancestor");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = root.join("codex");
+        fs::write(&executable, "binary").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(validate_owned_file(&executable, true).is_ok());
+        assert!(validate_owned_dir(&root, true).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn socket_readiness_requires_an_owned_unix_socket() {
         let root = test_root("socket-ready");
         fs::create_dir_all(&root).unwrap();
@@ -1994,20 +2924,79 @@ mod tests {
         }
         let child = command.spawn().unwrap();
         let process_group = child.id() as libc::pid_t;
+        let now = Instant::now();
         let mut process = ManagedProcess {
             child,
+            cleanup_deadline: None,
             entry_id: "entry".to_string(),
+            instance_id: 1,
+            last_touched: now,
+            leases: 0,
             process_group,
             proxy_host: "127.0.0.1".to_string(),
             proxy_port: 41000,
             socket_path: socket,
         };
         let entry = test_entry();
-        assert!(process_is_reusable(&mut process, &entry, 41000, false).unwrap());
-        assert!(!process_is_reusable(&mut process, &entry, 41001, false).unwrap());
-        assert!(!process_is_reusable(&mut process, &entry, 41000, true).unwrap());
+        assert!(process_is_reusable(&process, &entry, 41000, false).unwrap());
+        assert!(!process_is_reusable(&process, &entry, 41001, false).unwrap());
+        assert!(!process_is_reusable(&process, &entry, 41000, true).unwrap());
         stop_managed_process(&mut process);
         drop(listener);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_terminates_descendants_after_the_group_leader_exits() {
+        let root = test_root("exited-leader-descendant");
+        fs::create_dir_all(&root).unwrap();
+        let descendant_path = root.join("descendant.pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "trap '' TERM; sleep 300 & printf '%s' $! > '{}'",
+            descendant_path.display()
+        ));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let process_group = child.id() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !descendant_path.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_pid = fs::read_to_string(&descendant_path)
+            .unwrap()
+            .parse::<libc::pid_t>()
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let now = Instant::now();
+        let mut process = ManagedProcess {
+            child,
+            cleanup_deadline: None,
+            entry_id: "entry".to_string(),
+            instance_id: 1,
+            last_touched: now,
+            leases: 0,
+            process_group,
+            proxy_host: "127.0.0.1".to_string(),
+            proxy_port: 41000,
+            socket_path: root.join("unused.sock"),
+        };
+
+        stop_managed_process(&mut process);
+        let descendant_survived = test_process_is_live(descendant_pid);
+        if descendant_survived {
+            unsafe {
+                libc::kill(descendant_pid, libc::SIGKILL);
+            }
+        }
+        assert!(!descendant_survived, "descendant survived group cleanup");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2109,5 +3098,55 @@ mod tests {
             std::process::id(),
             random_hex(4).unwrap()
         ))
+    }
+
+    fn fake_socket_app_server(root: &Path) -> PathBuf {
+        let path = root.join("fake-app-server.py");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/python3
+import signal
+import socket
+import sys
+import time
+
+listen = sys.argv[sys.argv.index("--listen") + 1]
+socket_path = listen.removeprefix("unix://")
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(socket_path)
+server.listen()
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+while True:
+    time.sleep(0.1)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    fn test_process_is_live(pid: libc::pid_t) -> bool {
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, suffix)| suffix.trim_start().chars().next())
+            .is_some_and(|state| state != 'Z')
+    }
+
+    fn test_cleanup_timing() -> ProcessCleanupTiming {
+        ProcessCleanupTiming {
+            disconnected_grace: Duration::from_millis(80),
+            reaper_interval: Duration::from_millis(10),
+            unconnected_timeout: Duration::from_millis(80),
+        }
+    }
+
+    fn wait_for_process_count(manager: &RuntimeManager, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while manager.running_process_count() != expected && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(manager.running_process_count(), expected);
     }
 }
