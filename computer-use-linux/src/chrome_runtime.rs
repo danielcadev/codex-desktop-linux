@@ -1969,12 +1969,7 @@ fn has_unsafe_write_permissions(metadata: &fs::Metadata) -> bool {
     if mode & 0o002 != 0 {
         return true;
     }
-    if mode & 0o020 == 0 {
-        return false;
-    }
-    let euid = unsafe { libc::geteuid() };
-    let egid = unsafe { libc::getegid() };
-    metadata.uid() != euid || metadata.gid() != egid
+    mode & 0o020 != 0
 }
 
 fn unique_runtime_root() -> PathBuf {
@@ -2824,13 +2819,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_paths_reject_world_writable_files_and_accept_private_group_mode() {
+    fn runtime_paths_reject_group_or_world_writable_entries() {
         let root = test_root("path-permissions");
         fs::create_dir_all(&root).unwrap();
         let path = root.join("binary");
         fs::write(&path, "binary").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(!has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
+        assert!(has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(has_unsafe_write_permissions(&fs::metadata(&path).unwrap()));
         fs::remove_dir_all(root).unwrap();
@@ -2847,6 +2842,22 @@ mod tests {
         fs::write(&executable, "binary").unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(validate_owned_file(&executable, true).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn executable_validation_rejects_a_group_writable_parent() {
+        let root = test_root("group-writable-parent");
+        let unsafe_parent = root.join("shared");
+        fs::create_dir_all(&unsafe_parent).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let executable = unsafe_parent.join("codex");
+        fs::write(&executable, "binary").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(validate_owned_file(&executable, true).is_err());
+        assert!(validate_owned_dir(&unsafe_parent, true).is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

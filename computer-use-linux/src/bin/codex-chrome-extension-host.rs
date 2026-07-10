@@ -1082,6 +1082,8 @@ mod tests {
         let codex_home = root.join("codex-home");
         let resources = root.join("resources");
         let runtime_root = root.join("runtime");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir_all(&codex_home).unwrap();
         fs::create_dir_all(&resources).unwrap();
         fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1181,7 +1183,10 @@ while True:
 
         let response = read_captured_message(&output);
         assert_eq!(response["id"], "native-host:ensure");
-        assert_eq!(response["result"]["connected"], true);
+        assert_eq!(
+            response["result"]["connected"], true,
+            "runtime ensure response: {response}"
+        );
         assert_eq!(runtime_manager.running_process_count(), 1);
         let descendant_pid: libc::pid_t = fs::read_to_string(root.join("descendant.pid"))
             .unwrap()
