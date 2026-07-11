@@ -157,7 +157,6 @@ const {
   applyLocalEnvironmentActionModalDraftPatch,
   applyPersistentRateLimitFooterPatch,
   applyLinuxAppServerBackfillWaitPatch,
-  applyLinuxAppServerConversationHydrationPatch,
   applyLinuxCompletedItemRecoveryPatch,
   applyLinuxRemoteTerminalStatusRecoveryPatch,
   applyLinuxAppServerFeatureEnablementPatch,
@@ -1047,7 +1046,8 @@ test("default core patch descriptors are grouped and unique", () => {
     "linux-app-sunset-gate",
     "linux-app-server-feature-enablement",
     "linux-app-server-backfill-wait",
-    "linux-app-server-conversation-hydration",
+    "linux-completed-resume-recovery",
+    "linux-unowned-turn-claim",
     "linux-completed-item-recovery",
     "linux-remote-terminal-status-recovery",
     "linux-skills-list-dedupe",
@@ -5618,285 +5618,23 @@ test("keeps current app-server backfill helpers visible outside the Sentry handl
   assert.equal(context.turnTimeout, 3e4);
 });
 
-test("hydrates missing conversations when final app-server events arrive before turn start replay", async () => {
-  const source = [
-    "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
-    "class T{onNotification(e,t){let n={method:e,params:t};switch(n.method){case`turn/started`:{let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/started for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}this.markConversationStreaming(r),this.updateConversationState(r,e=>{});break}case`turn/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`turn/completed`,n.params)}))break;let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}break}case`item/started`:{let{item:e,threadId:t,turnId:r,startedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/started for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.markConversationStreaming(a),this.updateConversationState(a,t=>{});break}case`item/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`item/completed`,n.params)}))break;let{item:e,threadId:t,turnId:r,completedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/completed for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.updateConversationState(a,t=>{});break}}}}",
-  ].join("");
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
+test("keeps generic conversation recovery in core without remote hydration", () => {
+  const descriptors = corePatchDescriptors();
 
-  assert.match(patched, /codexLinuxRemoteMobileHydrateUnknownTurn/);
-  assert.match(patched, /codexLinuxRemoteMobileHydrateLateEvent/);
-  assert.match(patched, /codexLinuxRemoteMobilePendingNotifications\?\?=new Map/);
-  assert.match(patched, /codexLinuxRemoteMobileInFlightHydrations\?\?=new Set/);
-  assert.match(patched, /Hydrating conversation for turn\/completed/);
-  assert.match(patched, /Hydrating conversation for item\/completed/);
-  assert.match(patched, /Skipping hydration for ambiguous turn\/started/);
-
-  const context = {
-    module: { exports: {} },
-    I: (value) => value,
-    setTimeout,
-    z: { error() {}, warning() {} },
-  };
-  vm.runInNewContext(`${patched};module.exports=T;`, context);
-  const completedTurnManager = new context.module.exports();
-  const completedTurnReads = [];
-  completedTurnManager.conversations = new Map();
-  completedTurnManager.frameTextDeltaQueue = { drainBefore: () => false };
-  completedTurnManager.readThread = async (threadId) => {
-    completedTurnReads.push(threadId);
-    return { thread: { id: threadId }, turns: [{ id: "turn-a" }] };
-  };
-  completedTurnManager.upsertConversationFromThread = (thread) => {
-    completedTurnManager.conversations.set(thread.id, thread);
-  };
-
-  completedTurnManager.onNotification("turn/completed", {
-    threadId: "thread-a",
-    turn: { id: "turn-a", threadId: "thread-a", status: "completed" },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(completedTurnReads, ["thread-a"]);
-  assert.equal(completedTurnManager.codexLinuxRemoteMobilePendingNotifications?.has("thread-a"), false);
-  assert.equal(completedTurnManager.codexLinuxRemoteMobileInFlightHydrations?.has("thread-a"), false);
-
-  const completedItemManager = new context.module.exports();
-  const completedItemReads = [];
-  const updatedConversations = [];
-  completedItemManager.conversations = new Map();
-  completedItemManager.frameTextDeltaQueue = { drainBefore: () => false };
-  completedItemManager.readThread = async (threadId) => {
-    completedItemReads.push(threadId);
-    return { thread: { id: threadId }, turns: [{ id: "turn-a" }] };
-  };
-  completedItemManager.upsertConversationFromThread = (thread) => {
-    completedItemManager.conversations.set(thread.id, thread);
-  };
-  completedItemManager.updateConversationState = (threadId) => {
-    updatedConversations.push(threadId);
-  };
-
-  completedItemManager.onNotification("item/completed", {
-    item: { id: "item-a", type: "agentMessage" },
-    threadId: "thread-b",
-    turnId: "turn-b",
-    completedAtMs: 1,
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(completedItemReads, ["thread-b"]);
-  assert.deepEqual(updatedConversations, ["thread-b"]);
-  assert.equal(completedItemManager.codexLinuxRemoteMobilePendingNotifications?.has("thread-b"), false);
-  assert.equal(completedItemManager.codexLinuxRemoteMobileInFlightHydrations?.has("thread-b"), false);
-});
-
-test("does not hydrate summary-only app-server conversations without turns", async () => {
-  const source = [
-    "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
-    "class T{onNotification(e,t){let n={method:e,params:t};switch(n.method){case`turn/started`:{let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/started for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}this.markConversationStreaming(r),this.updateConversationState(r,e=>{});break}case`turn/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`turn/completed`,n.params)}))break;let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}break}case`item/started`:{let{item:e,threadId:t,turnId:r,startedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/started for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.markConversationStreaming(a),this.updateConversationState(a,t=>{});break}case`item/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`item/completed`,n.params)}))break;let{item:e,threadId:t,turnId:r,completedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/completed for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.updateConversationState(a,t=>{});break}}}}",
-  ].join("");
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
-  let scheduledRetry = null;
-  const context = {
-    module: { exports: {} },
-    I: (value) => value,
-    setTimeout(callback) {
-      scheduledRetry = callback;
-      return 1;
-    },
-    z: { error() {}, warning() {} },
-  };
-  vm.runInNewContext(`${patched};module.exports=T;`, context);
-  const manager = new context.module.exports();
-  const readThreadIds = [];
-  const upsertedThreads = [];
-
-  manager.conversations = new Map();
-  manager.frameTextDeltaQueue = { drainBefore: () => false };
-  manager.readThread = async (threadId) => {
-    readThreadIds.push(threadId);
-    return { thread: { id: threadId }, turns: [] };
-  };
-  manager.upsertConversationFromThread = (thread) => {
-    upsertedThreads.push(thread.id);
-    manager.conversations.set(thread.id, thread);
-  };
-
-  manager.onNotification("turn/completed", {
-    threadId: "thread-a",
-    turn: { id: "turn-a", threadId: "thread-a", status: "completed" },
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(readThreadIds, ["thread-a"]);
-  assert.deepEqual(upsertedThreads, []);
-  assert.equal(manager.conversations.has("thread-a"), false);
-  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications?.has("thread-a"), true);
-  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations?.has("thread-a"), true);
-  assert.equal(typeof scheduledRetry, "function");
-});
-
-test("coalesces final app-server events while hydrating a missing conversation", async () => {
-  const source = [
-    "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
-    "class T{onNotification(e,t){let n={method:e,params:t};switch(n.method){case`turn/started`:{let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/started for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}this.markConversationStreaming(r),this.updateConversationState(r,e=>{});break}case`turn/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`turn/completed`,n.params)}))break;let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}break}case`item/started`:{let{item:e,threadId:t,turnId:r,startedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/started for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.markConversationStreaming(a),this.updateConversationState(a,t=>{});break}case`item/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`item/completed`,n.params)}))break;let{item:e,threadId:t,turnId:r,completedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/completed for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.updateConversationState(a,t=>{});break}}}}",
-  ].join("");
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
-  const context = {
-    module: { exports: {} },
-    I: (value) => value,
-    setTimeout,
-    z: { error() {}, warning() {} },
-  };
-  vm.runInNewContext(`${patched};module.exports=T;`, context);
-  const manager = new context.module.exports();
-  const readThreadIds = [];
-  const updatedConversations = [];
-  let resolveRead;
-
-  manager.conversations = new Map();
-  manager.frameTextDeltaQueue = { drainBefore: () => false };
-  manager.readThread = (threadId) => {
-    readThreadIds.push(threadId);
-    return new Promise((resolve) => {
-      resolveRead = () => resolve({ thread: { id: threadId }, turns: [{ id: "turn-a" }] });
-    });
-  };
-  manager.upsertConversationFromThread = (thread) => {
-    manager.conversations.set(thread.id, thread);
-  };
-  manager.updateConversationState = (threadId) => {
-    updatedConversations.push(threadId);
-  };
-
-  manager.onNotification("turn/completed", {
-    threadId: "thread-a",
-    turn: { id: "turn-a", threadId: "thread-a", status: "completed" },
-  });
-  manager.onNotification("item/completed", {
-    item: { id: "item-a", type: "agentMessage" },
-    threadId: "thread-a",
-    turnId: "turn-a",
-    completedAtMs: 1,
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(readThreadIds, ["thread-a"]);
-  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications.get("thread-a").length, 2);
-  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations.has("thread-a"), true);
-
-  resolveRead();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications?.has("thread-a"), false);
-  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations?.has("thread-a"), false);
-  assert.deepEqual(updatedConversations, ["thread-a"]);
-});
-
-test("restarts late-event hydration when a pending queue exists without an in-flight read", async () => {
-  const source = [
-    "function Of({conversationId:e,conversations:t,getWorkspaceBrowserRoot:n,getWorkspaceKind:r,hostId:i,setConversation:a,thread:o,threadsById:s,updateConversationState:c}){let h=o.status??null;if(t.has(e)){c(e,e=>{e.resumeState===`needs_resume`&&(e.threadRuntimeStatus=h)});return}}",
-    "class T{onNotification(e,t){let n={method:e,params:t};switch(n.method){case`turn/started`:{let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/started for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}this.markConversationStreaming(r),this.updateConversationState(r,e=>{});break}case`turn/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`turn/completed`,n.params)}))break;let{threadId:e,turn:t}=n.params,r=I(e);if(!this.conversations.get(r)){z.error(`Received turn/completed for unknown conversation`,{safe:{conversationId:r},sensitive:{}});break}break}case`item/started`:{let{item:e,threadId:t,turnId:r,startedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/started for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.markConversationStreaming(a),this.updateConversationState(a,t=>{});break}case`item/completed`:{if(this.frameTextDeltaQueue.drainBefore(()=>{this.onNotification(`item/completed`,n.params)}))break;let{item:e,threadId:t,turnId:r,completedAtMs:i}=n.params,a=I(t);if(!this.conversations.get(a)){z.error(`Received item/completed for unknown conversation`,{safe:{conversationId:a},sensitive:{}});break}this.updateConversationState(a,t=>{});break}}}}",
-  ].join("");
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
-  const context = {
-    module: { exports: {} },
-    I: (value) => value,
-    setTimeout,
-    z: { error() {}, warning() {} },
-  };
-  vm.runInNewContext(`${patched};module.exports=T;`, context);
-  const manager = new context.module.exports();
-  const readThreadIds = [];
-  const updatedConversations = [];
-  let resolveRead;
-
-  manager.conversations = new Map();
-  manager.frameTextDeltaQueue = { drainBefore: () => false };
-  manager.codexLinuxRemoteMobilePendingNotifications = new Map([
-    [
-      "thread-a",
-      [
-        {
-          method: "turn/completed",
-          params: { threadId: "thread-a", turn: { id: "turn-a", threadId: "thread-a" } },
-        },
-      ],
-    ],
-  ]);
-  manager.readThread = (threadId) => {
-    readThreadIds.push(threadId);
-    return new Promise((resolve) => {
-      resolveRead = () => resolve({ thread: { id: threadId }, turns: [{ id: "turn-a" }] });
-    });
-  };
-  manager.upsertConversationFromThread = (thread) => {
-    manager.conversations.set(thread.id, thread);
-  };
-  manager.updateConversationState = (threadId) => {
-    updatedConversations.push(threadId);
-  };
-
-  manager.onNotification("item/completed", {
-    item: { id: "item-a", type: "agentMessage" },
-    threadId: "thread-a",
-    turnId: "turn-a",
-    completedAtMs: 1,
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(readThreadIds, ["thread-a"]);
-  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications.get("thread-a").length, 2);
-  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations.has("thread-a"), true);
-
-  resolveRead();
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(manager.codexLinuxRemoteMobilePendingNotifications?.has("thread-a"), false);
-  assert.equal(manager.codexLinuxRemoteMobileInFlightHydrations?.has("thread-a"), false);
-  assert.deepEqual(updatedConversations, ["thread-a"]);
-});
-
-test("discovers current app-server conversation core Linux webview patches", () => {
-  const legacyConversationAsset =
-    "app-initial~app-main~worktree-init-v2-page~remote-conversation-page~new-thread-panel-page~o~bj5tp28r-Dcs9S3fj.js";
-  const legacyLatestConversationAsset =
-    "app-initial~app-main~new-thread-panel-page~appgen-library-page~hotkey-window-thread-page~ho~glxlkd48-Bty5T9_s.js";
-  const currentConversationAsset =
-    "app-initial~app-main~pull-request-code-review~onboarding-page~hotkey-window-thread-page~cha~b76hmflu-y0KJWbm3.js";
-  const oldConversationAsset =
-    "app-initial~app-main~hotkey-window-thread-page~thread-app-shell-chrome~header~remote-conver~h59fr3q5-Cm3GYhJA.js";
-  const projectlessRemoteTaskAsset =
-    "app-initial~app-main~worktree-init-v2-page~remote-conversation-page~pull-requests-page~plug~kmtatxxf-DEE2TwPG.js";
-  const latestProjectlessRemoteTaskAsset =
-    "app-initial~app-main~new-thread-panel-page~appgen-library-page~hotkey-window-thread-page~ho~iufn7mg3-MXsOJYYa.js";
-
-  for (const id of ["linux-app-server-conversation-hydration", "linux-completed-item-recovery"]) {
-    const descriptor = corePatchDescriptors().find((patch) => patch.id === id);
-
-    assert.ok(descriptor);
-    assert.equal(descriptor.phase, "webview-asset");
-    assert.equal(descriptor.ciPolicy, "optional");
-    assert.equal(
-      descriptor.pattern.test(
-        "app-initial~app-main~onboarding-page~hotkey-window-thread-page~quick-chat-window-page~chatg~gwqc41kz-Bj9ubaFn.js",
-      ),
-      true,
-    );
-    assert.equal(descriptor.pattern.test(currentConversationAsset), false);
-    assert.equal(descriptor.pattern.test(legacyConversationAsset), false);
-    assert.equal(descriptor.pattern.test(legacyLatestConversationAsset), false);
-    assert.equal(descriptor.pattern.test(oldConversationAsset), false);
-    assert.equal(descriptor.pattern.test(projectlessRemoteTaskAsset), false);
-    assert.equal(descriptor.pattern.test(latestProjectlessRemoteTaskAsset), false);
-    assert.equal(descriptor.pattern.test("app-server-manager-signals-test.js"), false);
-    assert.equal(descriptor.pattern.test("remote-connections-settings-fixture.js"), false);
-  }
+  assert.equal(
+    descriptors.some((patch) => patch.id === "linux-app-server-conversation-hydration"),
+    false,
+  );
+  assert.ok(descriptors.some((patch) => patch.id === "linux-completed-resume-recovery"));
+  assert.ok(descriptors.some((patch) => patch.id === "linux-unowned-turn-claim"));
+  assert.ok(descriptors.some((patch) => patch.id === "linux-completed-item-recovery"));
 });
 
 test("does not retain streaming ownership when a completed thread resumes without an active runtime", () => {
+  const descriptor = corePatchDescriptors().find(
+    (patch) => patch.id === "linux-completed-resume-recovery",
+  );
+  assert.ok(descriptor);
   const source = [
     "async function resume(e,t,L,ue,b){",
     "e.updateConversationState(t,t=>{t.threadRuntimeStatus=L.thread.status});",
@@ -5906,7 +5644,7 @@ test("does not retain streaming ownership when a completed thread resumes withou
     "}",
   ].join("");
 
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
+  const patched = applyPatchTwice(descriptor.apply, source);
 
   assert.match(patched, /let codexLinuxResumeShouldStream=/);
   assert.match(patched, /markedStreaming:codexLinuxResumeShouldStream/);
@@ -5958,6 +5696,10 @@ test("does not retain streaming ownership when a completed thread resumes withou
 });
 
 test("claims an unowned completed thread when starting a new turn", async () => {
+  const descriptor = corePatchDescriptors().find(
+    (patch) => patch.id === "linux-unowned-turn-claim",
+  );
+  assert.ok(descriptor);
   const source = [
     "async function start(e,t,c){",
     "let p=await MF({conversationId:t,getStreamRole:t=>e.getStreamRole(t),sendRequest:r=>e.sendThreadFollowerRequest(r,`thread-follower-start-turn`,{conversationId:t})});",
@@ -5968,7 +5710,7 @@ test("claims an unowned completed thread when starting a new turn", async () => 
     "}",
   ].join("");
 
-  const patched = applyPatchTwice(applyLinuxAppServerConversationHydrationPatch, source);
+  const patched = applyPatchTwice(descriptor.apply, source);
 
   assert.match(patched, /codexLinuxClaimUnownedTurn/);
   const context = {};

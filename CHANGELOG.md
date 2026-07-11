@@ -21,6 +21,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   XDG GlobalShortcuts and RemoteDesktop portals for press, release, and paste
   handling without direct input-device access or elevated permissions.
 
+### Changed
+
+- Remote notification hydration and replay are no longer part of the default
+  Linux patch set and remain owned by the disabled-by-default
+  `remote-mobile-control` feature. The current-DMG completed-resume and
+  unowned-turn fixes remain active as separate core patches.
+
 ### Fixed
 
 - Automated user-local updates no longer inherit or set developer overrides
