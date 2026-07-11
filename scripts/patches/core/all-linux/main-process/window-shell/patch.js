@@ -97,7 +97,7 @@ module.exports = [
     id: "linux-x11-project-picker",
     phase: "main-bundle",
     order: 82,
-    ciPolicy: "required-upstream",
+    ciPolicy: "optional",
     apply: applyLinuxX11ProjectPickerPatch,
   }),
   mainBundlePatch({

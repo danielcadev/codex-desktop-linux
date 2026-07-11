@@ -79,7 +79,7 @@ function applyLinuxX11ProjectPickerPatch(currentSource) {
   const [, optionsVar, propertiesVar, parentVar, electronVar, webContentsVar, resultVar] = match;
   return currentSource.replace(
     pickerPattern,
-    `let ${optionsVar}={properties:${propertiesVar},title:\`Select Project Root\`},${parentVar}=${electronVar}.BrowserWindow.fromWebContents(${webContentsVar}),codexLinuxUseUnparentedX11ProjectPicker=process.platform===\`linux\`&&((process.env.XDG_SESSION_TYPE||\`\`).trim().toLowerCase()===\`x11\`||!process.env.WAYLAND_DISPLAY&&!!process.env.DISPLAY),${resultVar}=codexLinuxUseUnparentedX11ProjectPicker||${parentVar}==null?await ${electronVar}.dialog.showOpenDialog(${optionsVar}):await ${electronVar}.dialog.showOpenDialog(${parentVar},${optionsVar})`,
+    `let ${optionsVar}={properties:${propertiesVar},title:\`Select Project Root\`},${parentVar}=${electronVar}.BrowserWindow.fromWebContents(${webContentsVar}),codexLinuxSessionType=(process.env.XDG_SESSION_TYPE||\`\`).trim().toLowerCase(),codexLinuxUseUnparentedX11ProjectPicker=process.platform===\`linux\`&&(codexLinuxSessionType===\`x11\`||codexLinuxSessionType!==\`wayland\`&&!process.env.WAYLAND_DISPLAY&&!!process.env.DISPLAY),${resultVar}=codexLinuxUseUnparentedX11ProjectPicker||${parentVar}==null?await ${electronVar}.dialog.showOpenDialog(${optionsVar}):await ${electronVar}.dialog.showOpenDialog(${parentVar},${optionsVar})`,
   );
 }
 

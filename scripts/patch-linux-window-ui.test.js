@@ -1096,6 +1096,10 @@ test("default core patch descriptors are grouped and unique", () => {
     "optional",
   );
   assert.equal(
+    descriptors.find((descriptor) => descriptor.id === "linux-x11-project-picker")?.ciPolicy,
+    "optional",
+  );
+  assert.equal(
     descriptors.find((descriptor) => descriptor.id === "linux-computer-use-native-desktop-apps")?.ciPolicy,
     "opt-in",
   );
@@ -1855,6 +1859,22 @@ test("opens the project picker without a parent window on Linux X11", async () =
   });
   assert.deepEqual(await run("linux", { DISPLAY: ":0" }), {
     argumentCount: 1,
+    roots: ["/tmp/project"],
+  });
+  assert.deepEqual(await run("linux", { DISPLAY: ":0", WAYLAND_DISPLAY: "wayland-0" }), {
+    argumentCount: 2,
+    roots: ["/tmp/project"],
+  });
+  assert.deepEqual(await run("linux", { XDG_SESSION_TYPE: "unknown", DISPLAY: ":0" }), {
+    argumentCount: 1,
+    roots: ["/tmp/project"],
+  });
+  assert.deepEqual(
+    await run("linux", { XDG_SESSION_TYPE: "unknown", DISPLAY: ":0", WAYLAND_DISPLAY: "wayland-0" }),
+    { argumentCount: 2, roots: ["/tmp/project"] },
+  );
+  assert.deepEqual(await run("linux", { XDG_SESSION_TYPE: " Wayland ", DISPLAY: ":0" }), {
+    argumentCount: 2,
     roots: ["/tmp/project"],
   });
   assert.deepEqual(
