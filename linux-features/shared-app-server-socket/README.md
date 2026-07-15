@@ -26,6 +26,12 @@ Keep the socket in a directory accessible only to the owning user. It is a local
 control endpoint and must not be exposed directly over TCP or forwarded as a
 network service.
 
+Authority startup is serialized by an owner-only lock next to the socket. The
+feature fails closed if either path already exists; it never guesses that an
+existing socket or lock is stale. After an abnormal Desktop termination, verify
+that no authority still owns the configured endpoint before removing stale
+paths and restarting Desktop.
+
 ## SSH setup
 
 Use a stable socket path when the Desktop instance will be reached over SSH:
@@ -52,11 +58,26 @@ fi
 exec "$real_codex" "$@"
 ```
 
+The upstream SSH transport normally starts its own authority before invoking
+the proxy. Configure the **remote account's login-shell environment** to skip
+that bootstrap when this wrapper is used:
+
+```bash
+export CODEX_SSH_SKIP_APP_SERVER_BOOT=true
+```
+
+Put that export in the startup file read by the account's SSH login shell (for
+example `~/.profile` when that is the active login profile). This is remote
+account configuration; setting it only in the local Desktop launcher does not
+propagate it through SSH. Use it only for an account whose wrapper is dedicated
+to this Desktop-owned socket.
+
 Make the wrapper executable and verify that non-interactive SSH resolves it:
 
 ```bash
 chmod 0755 "$HOME/.local/bin/codex"
 ssh host 'command -v codex'
+ssh host 'printf "%s\n" "$CODEX_SSH_SKIP_APP_SERVER_BOOT"'
 ```
 
 Codex SSH clients can then connect normally; no client-side protocol option or
