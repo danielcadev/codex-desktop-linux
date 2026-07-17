@@ -21,6 +21,12 @@ const guardedLockRegex =
 const unguardedLockRegex =
   /if\(!\(!([A-Za-z_$][\w$]*)\|\|([A-Za-z_$][\w$]*)\.app\.requestSingleInstanceLock\(\)\)\)/;
 
+const bootstrapFailureTailRegex =
+  /(for\(let ([A-Za-z_$][\w$]*) of ([A-Za-z_$][\w$]*)\.BrowserWindow\.getAllWindows\(\)\)\2\.isDestroyed\(\)\|\|\2\.destroy\(\);[^]{0,400}?`Desktop bootstrap failed to start the main app`[^]{0,400}?),await ([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\)/;
+const patchedBootstrapFailureTailRegex =
+  /Desktop bootstrap failed to start the main app[^]*?process\.platform===`linux`\?Promise\.race\([^]*?process\.platform===`linux`&&[A-Za-z_$][\w$]*\.app\.exit\(1\)/;
+const linuxBootstrapFailureExitTimeoutMs = "15e3";
+
 function enforcedLockCondition(enabledVar, appVar) {
   return (
     "if(!(process.platform===`linux`?process.env.CODEX_LINUX_MULTI_LAUNCH===`1`||" +
@@ -57,6 +63,38 @@ function applyLinuxMultiInstanceBootstrapPatch(currentSource) {
   return currentSource;
 }
 
+// The upstream bootstrap catches failures from runMainAppStartup(), destroys
+// every BrowserWindow, and waits on a native error dialog. On Linux, the main
+// bundle may already have created the warm-start socket before that failure.
+// If the native dialog is hidden or never resolves, the windowless process
+// keeps the single-instance lock and acknowledges every later launch forever.
+// Bound the dialog wait and terminate the failed bootstrap so the launcher can
+// perform a real cold start on the next attempt.
+function applyLinuxBootstrapFailureExitPatch(currentSource) {
+  if (patchedBootstrapFailureTailRegex.test(currentSource)) {
+    return currentSource;
+  }
+
+  if (!bootstrapFailureTailRegex.test(currentSource)) {
+    if (currentSource.includes("Desktop bootstrap failed to start the main app")) {
+      console.warn(
+        "WARN: Could not find bootstrap failure handler — Linux failed starts may retain the single-instance lock",
+      );
+    }
+    return currentSource;
+  }
+
+  return currentSource.replace(
+    bootstrapFailureTailRegex,
+    (_match, prefix, _windowVar, electronVar, failureDialogVar, errorVar) => {
+      const boundedFailureDialog =
+        `await (process.platform===\`linux\`?Promise.race([${failureDialogVar}(${errorVar}),` +
+        `new Promise(e=>setTimeout(e,${linuxBootstrapFailureExitTimeoutMs}))]):${failureDialogVar}(${errorVar}))`;
+      return `${prefix},${boundedFailureDialog},process.platform===\`linux\`&&${electronVar}.app.exit(1)`;
+    },
+  );
+}
+
 function patchLinuxMultiInstanceBootstrap(extractedDir) {
   const target = path.join(extractedDir, ".vite", "build", "bootstrap.js");
   if (!fs.existsSync(target)) {
@@ -73,7 +111,25 @@ function patchLinuxMultiInstanceBootstrap(extractedDir) {
   return { changed: true };
 }
 
+function patchLinuxBootstrapFailureExit(extractedDir) {
+  const target = path.join(extractedDir, ".vite", "build", "bootstrap.js");
+  if (!fs.existsSync(target)) {
+    return { changed: false, reason: "bootstrap.js not found" };
+  }
+
+  const source = fs.readFileSync(target, "utf8");
+  const patched = applyLinuxBootstrapFailureExitPatch(source);
+  if (patched === source) {
+    return { changed: false };
+  }
+
+  fs.writeFileSync(target, patched, "utf8");
+  return { changed: true };
+}
+
 module.exports = {
+  applyLinuxBootstrapFailureExitPatch,
   applyLinuxMultiInstanceBootstrapPatch,
+  patchLinuxBootstrapFailureExit,
   patchLinuxMultiInstanceBootstrap,
 };

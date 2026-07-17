@@ -113,6 +113,7 @@ const {
   applyLinuxSettingsPersistencePatch,
 } = require("./patches/impl/launch-actions.js");
 const {
+  applyLinuxBootstrapFailureExitPatch,
   applyLinuxMultiInstanceBootstrapPatch,
 } = require("./patches/impl/bootstrap.js");
 const {
@@ -924,6 +925,7 @@ test("default core patch descriptors are grouped and unique", () => {
     "linux-native-titlebar",
     "linux-menu",
     "linux-multi-instance-bootstrap-lock",
+    "linux-bootstrap-failure-exit",
     "linux-set-icon",
     "linux-resize-repaint",
     "linux-opaque-background",
@@ -4545,6 +4547,65 @@ test("upgrades the legacy guarded bootstrap single-instance lock to the enforced
     /if\(!\(process\.platform===`linux`\?process\.env\.CODEX_LINUX_MULTI_LAUNCH===`1`\|\|e\.app\.requestSingleInstanceLock\(\):!\$\|\|e\.app\.requestSingleInstanceLock\(\)\)\)/,
   );
   assert.ok(!patched.includes("&&process.env.CODEX_LINUX_MULTI_LAUNCH"));
+});
+
+function bootstrapFailureBundleFixture() {
+  return [
+    "async function boot(){try{throw Error(`boom`)}catch(e){",
+    "for(let t of i.BrowserWindow.getAllWindows())t.isDestroyed()||t.destroy();",
+    "l.ei().error(`Desktop bootstrap failed to start the main app`,{safe:{phase:`bootstrap-import-main`}}),",
+    "n.captureException(e,{tags:{phase:`bootstrap-import-main`}}),await oe(e)}}",
+  ].join("");
+}
+
+test("bounds Linux bootstrap failure dialogs and exits the failed instance", () => {
+  const patched = applyPatchTwice(
+    applyLinuxBootstrapFailureExitPatch,
+    bootstrapFailureBundleFixture(),
+  );
+
+  assert.match(
+    patched,
+    /process\.platform===`linux`\?Promise\.race\(\[oe\(e\),new Promise\(e=>setTimeout\(e,15e3\)\)\]\):oe\(e\)/,
+  );
+  assert.match(patched, /process\.platform===`linux`&&i\.app\.exit\(1\)/);
+  assert.equal((patched.match(/i\.app\.exit\(1\)/g) ?? []).length, 1);
+});
+
+test("Linux bootstrap failure exits even when the native dialog never resolves", async () => {
+  const patched = applyLinuxBootstrapFailureExitPatch(bootstrapFailureBundleFixture());
+  const calls = { capture: 0, destroy: 0, exit: [] };
+  const context = {
+    Error,
+    Promise,
+    process: { platform: "linux" },
+    setTimeout(callback) {
+      callback();
+      return 1;
+    },
+    i: {
+      BrowserWindow: {
+        getAllWindows: () => [{
+          destroy: () => { calls.destroy += 1; },
+          isDestroyed: () => false,
+        }],
+      },
+      app: {
+        exit: (status) => calls.exit.push(status),
+      },
+    },
+    l: { ei: () => ({ error() {} }) },
+    n: { captureException: () => { calls.capture += 1; } },
+    oe: () => new Promise(() => {}),
+  };
+  context.globalThis = context;
+
+  vm.runInNewContext(`${patched};globalThis.runBootstrap=boot`, context);
+  await context.runBootstrap();
+
+  assert.equal(calls.destroy, 1);
+  assert.equal(calls.capture, 1);
+  assert.deepEqual(calls.exit, [1]);
 });
 
 test("enforced bootstrap lock takes the Linux lock with upstream flag off and exits the loser", () => {
