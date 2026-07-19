@@ -23,9 +23,10 @@ module.exports = [
     id: "linux-bootstrap-failure-exit",
     phase: "extracted-app:pre-webview",
     order: 126,
-    // A missed handler leaves a windowless process holding the single-instance
-    // lock, so current upstream drift must reject the generated app.
-    ciPolicy: "required-upstream",
+    // This recovery keeps a failed Linux bootstrap from retaining the
+    // single-instance lock, but drift should remain fail-soft so a changed
+    // upstream failure path does not reject an otherwise usable app.
+    ciPolicy: "optional",
     apply: patchLinuxBootstrapFailureExit,
   }),
 ];

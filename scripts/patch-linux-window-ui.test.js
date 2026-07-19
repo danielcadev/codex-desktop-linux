@@ -4660,14 +4660,48 @@ test("fails required bootstrap patches when the production target is missing or 
           report.patches.map(({ name, status }) => ({ name, status })),
           [
             { name: "linux-multi-instance-bootstrap-lock", status: "failed-required" },
-            { name: "linux-bootstrap-failure-exit", status: "failed-required" },
+            { name: "linux-bootstrap-failure-exit", status: "skipped-optional" },
           ],
         );
-        assert.equal(criticalFailuresFromReport(report).length, 2);
+        assert.equal(criticalFailuresFromReport(report).length, 1);
       } finally {
         fs.rmSync(tempRoot, { recursive: true, force: true });
       }
     });
+  }
+});
+
+test("warns without failing when the optional bootstrap failure handler drifts", () => {
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-bootstrap-handler-drift-"));
+  try {
+    const buildDir = path.join(tempRoot, ".vite", "build");
+    const bundlePath = path.join(buildDir, "bootstrap-current.js");
+    fs.mkdirSync(buildDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(buildDir, "early-bootstrap.js"),
+      'require("./bootstrap-current.js");',
+    );
+    fs.writeFileSync(
+      bundlePath,
+      "var S=t.x({isMacOS:b,isPackaged:i.app.isPackaged});" +
+        "if(!(!S||i.app.requestSingleInstanceLock()))i.app.exit(0);",
+    );
+
+    const report = applyBootstrapDescriptors(tempRoot);
+    assert.deepEqual(
+      report.patches.map(({ name, status }) => ({ name, status })),
+      [
+        { name: "linux-multi-instance-bootstrap-lock", status: "applied" },
+        { name: "linux-bootstrap-failure-exit", status: "skipped-optional" },
+      ],
+    );
+    assert.equal(criticalFailuresFromReport(report).length, 0);
+    assert.match(
+      report.patches[1].reason,
+      /Could not find bootstrap failure handler/,
+    );
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 });
 

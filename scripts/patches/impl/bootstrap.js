@@ -101,11 +101,9 @@ function applyLinuxBootstrapFailureExitPatch(currentSource) {
   }
 
   if (!bootstrapFailureTailRegex.test(currentSource)) {
-    if (currentSource.includes("Desktop bootstrap failed to start the main app")) {
-      console.warn(
-        "WARN: Could not find bootstrap failure handler — Linux failed starts may retain the single-instance lock",
-      );
-    }
+    console.warn(
+      "WARN: Could not find bootstrap failure handler — Linux failed starts may retain the single-instance lock",
+    );
     return currentSource;
   }
 
