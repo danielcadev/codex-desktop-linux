@@ -1340,6 +1340,7 @@ test_appimage_builder_smoke() {
     make_fake_app "$app_dir"
     mkdir -p "$app_dir/resources/codex-cli"
     printf '%s\n' 'upstream-payload' > "$app_dir/resources/codex-cli/preserve.txt"
+    chmod 0775 "$app_dir" "$app_dir/resources"
 
     cat > "$bin_dir/appimagetool" <<'SCRIPT'
 #!/usr/bin/env bash
@@ -1390,6 +1391,8 @@ SCRIPT
     assert_file_exists "$capture_dir/AppDir/opt/codex-desktop/.codex-linux/codex-packaged-runtime.sh"
     assert_file_exists "$capture_dir/AppDir/opt/codex-desktop/resources/node-runtime/bin/node"
     assert_file_exists "$capture_dir/AppDir/opt/codex-desktop/resources/codex-cli/preserve.txt"
+    assert_mode "$capture_dir/AppDir/opt/codex-desktop" "755"
+    assert_mode "$capture_dir/AppDir/opt/codex-desktop/resources" "755"
     assert_file_not_exists "$capture_dir/AppDir/opt/codex-desktop/resources/codex-cli/bin/codex"
     assert_file_not_exists "$capture_dir/AppDir/usr/bin/codex-update-manager"
     assert_file_not_exists "$capture_dir/AppDir/usr/lib/systemd/user/codex-update-manager.service"
@@ -5098,12 +5101,29 @@ test_launcher_marketplace_metadata_atomic_staging() (
 
     mkdir -p "$(dirname "$source_marketplace")" "$target_dir"
     printf '%s\n' 'new metadata' > "$source_marketplace"
-    awk '/^stage_bundled_marketplace_metadata\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+    awk '/^make_path_owner_trusted\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
         "$REPO_DIR/launcher/start.sh.template" > "$function_file"
+    awk '/^path_has_unsafe_write\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+        "$REPO_DIR/launcher/start.sh.template" >> "$function_file"
+    awk '/^prepare_bundled_marketplace_tmp_root\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+        "$REPO_DIR/launcher/start.sh.template" >> "$function_file"
+    awk '/^stage_bundled_marketplace_metadata\(\) \{/{copy=1} copy{print} copy && /^}/{exit}' \
+        "$REPO_DIR/launcher/start.sh.template" >> "$function_file"
     # shellcheck source=/dev/null
     source "$function_file"
     SCRIPT_DIR="$app_dir"
     CODEX_HOME="$codex_home"
+
+    chmod 0775 "$codex_home" "$codex_home/.tmp" "$codex_home/.tmp/bundled-marketplaces"
+    prepare_bundled_marketplace_tmp_root
+    for trusted_path in \
+        "$codex_home" \
+        "$codex_home/.tmp" \
+        "$codex_home/.tmp/bundled-marketplaces"; do
+        if find "$trusted_path" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+            fail "Bundled marketplace parent remained group/world writable: $trusted_path"
+        fi
+    done
 
     for failing_command in cp chmod mv; do
         printf '%s\n' 'existing metadata' > "$target_marketplace"
@@ -5379,7 +5399,7 @@ if "second_instance_handoff_ready" not in runtime_body:
     raise SystemExit("second-instance handoff must skip cold-start setup")
 if "clear_bundled_marketplace_tmp_cache\nreconcile_runtime_state" in runtime_body:
     raise SystemExit("warm-start path must not clear bundled marketplace temp cache")
-if not re.search(r'if needs_cold_start; then\s+log_phase "cold_start_cache_sync_start"\s+clear_bundled_marketplace_tmp_cache.*?stage_bundled_marketplace_metadata.*?sync_browser_use_bundled_plugin_cache &.*?sync_chrome_bundled_plugin_cache &.*?sync_computer_use_bundled_plugin_cache &.*?sync_read_aloud_bundled_plugin_cache &.*?sync_extra_bundled_plugin_cache &.*?run_cold_start_hooks.*?log_phase "cold_start_hooks_dispatched"\s+await_webview_server_ready\s+fi', runtime_body, re.S):
+if not re.search(r'if needs_cold_start; then\s+log_phase "cold_start_cache_sync_start"\s+if ! prepare_bundled_marketplace_tmp_root; then.*?clear_bundled_marketplace_tmp_cache.*?stage_bundled_marketplace_metadata.*?sync_browser_use_bundled_plugin_cache &.*?sync_chrome_bundled_plugin_cache &.*?sync_computer_use_bundled_plugin_cache &.*?sync_read_aloud_bundled_plugin_cache &.*?sync_extra_bundled_plugin_cache &.*?run_cold_start_hooks.*?log_phase "cold_start_hooks_dispatched"\s+await_webview_server_ready\s+fi', runtime_body, re.S):
     raise SystemExit("bundled marketplace cleanup, staged metadata, concurrent plugin syncs, cold-start hooks, and the webview readiness wait must run only on cold start")
 # The plugin syncs run concurrently, so the shared marketplace.json is staged
 # exactly once beforehand and every sync is awaited before cold-start hooks.
